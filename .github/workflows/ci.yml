@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: nexxpass
+          POSTGRES_PASSWORD: change-me
+          POSTGRES_DB: nexxpass_sync
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Format check
+        run: cargo fmt --check
+        working-directory: backend
+
+      - name: Clippy lints
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: backend
+
+      - name: Test suite (unit, vectors, integration)
+        run: cargo test --all-targets
+        working-directory: backend
+        env:
+          DATABASE_URL: postgres://nexxpass:change-me@localhost:5432/nexxpass_sync

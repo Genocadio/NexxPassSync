@@ -7,3 +7,4 @@ pub mod http;
 pub mod pairing;
 pub mod registration;
 pub mod state;
+pub mod sync;

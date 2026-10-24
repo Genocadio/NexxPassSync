@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
             "/pairings/{pairing_id}/approve",
             post(crate::pairing::approve_pairing),
         )
+        .route("/sync/batch", post(crate::sync::handle_sync_batch))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::authenticate_device,
@@ -36,7 +37,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/health", health::routes())
         .nest("/v1", api_v1)
         .fallback(|| async { StatusCode::NOT_FOUND })
-        .layer(RequestBodyLimitLayer::new(128 * 1024))
+        .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         // Avoid TraceLayer's default header/body recording. Keep request logs
         // metadata-only; signed bytes and secrets must never be emitted.

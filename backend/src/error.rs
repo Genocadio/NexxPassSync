@@ -36,6 +36,8 @@ pub enum AppError {
     PairingChallengeInvalid,
     #[error("account key rotation is in progress")]
     RotationInProgress,
+    #[error("operation id reused with different hash")]
+    OperationIdReused,
     #[error("conflict")]
     Conflict,
     #[error("service unavailable")]
@@ -140,7 +142,13 @@ impl IntoResponse for AppError {
             Self::RotationInProgress => (
                 StatusCode::CONFLICT,
                 "rotation_in_progress",
-                "Pairing is unavailable during this key rotation.",
+                "Pairing or mutation is unavailable during this key rotation.",
+                None,
+            ),
+            Self::OperationIdReused => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "operation_id_reused",
+                "Operation ID was previously used with a different hash.",
                 None,
             ),
             Self::Conflict => (

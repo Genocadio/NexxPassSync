@@ -9,23 +9,18 @@ protocol decision changes; do not silently invent a second wire format here.
 ## Current state
 
 The Rust/Axum/PostgreSQL service implements signed account registration,
-authenticated `GET /v1/accounts/me`, request replay protection, and device
-pairing. Pairing challenges are short-lived and do not reveal account
-existence. Approval atomically adds a device and opaque key wraps. Pairing can
-join an in-progress `master_password_change` only with active and target wraps.
+authenticated `GET /v1/accounts/me`, request replay protection, device
+pairing, and encrypted item batch mutations (`POST /v1/sync/batch`).
 
-The backend does not yet store vault items, serve sync pulls, acknowledge
-checkpoints, or implement recovery or key-rotation transitions. Therefore two
-paired devices cannot yet exchange vault data. Rotation fields and participant
-acknowledgements exist in the schema, but are not an operational state machine.
-Do not expose a transition that freezes writes until its resume, abort, device
-revocation, and completion paths are also available.
+Milestone 0 and Milestone 1 are complete:
+- Locked dependencies in `Cargo.lock` and `.github/workflows/ci.yml` providing automated CI checks across formatting (`cargo fmt --check`), strict clippy lints (`-D warnings`), protocol specification vectors (`tests/vectors.rs`), and end-to-end PostgreSQL integration testing (`tests/integration.rs`).
+- Normative vectors from `protocol-v1.json` are verified directly: operation hash calculation for both `put` and `delete`, device public key digest calculation, and raw body signature canonicalization.
+- Additive database migration `0004_items_and_sync_batch.sql` establishes `items`, immutable `item_changes`, permanent `retired_item_ids`, and `operations` with retention indexes and blob size constraints (552 to 65536 bytes).
+- `/v1/sync/batch` handles up to 100 operations in request order under single account-row locking (`SELECT ... FOR UPDATE`), strictly rejects duplicate `operation_id` or `item_id` within a batch, validates key versions against rotation state and write-freeze (`master_password_change`), performs canonical binary `NPSOp1` operation hashing, provides exact retry idempotency, rejects operation ID reuse with changed payload (HTTP 422 `operation_id_reused`), and enforces monotonic version/sequence progression and permanent UUID retirement upon deletion.
 
-Current local checks pass: `cargo fmt --check`, `cargo test --offline` (3 pairing
-validation unit tests), and `cargo clippy --offline --all-targets -- -D
-warnings`. `Cargo.lock` is present. There are not yet PostgreSQL integration
-tests or CI jobs, so database transaction behavior and deployed migrations are
-not covered by this check.
+The backend does not yet serve sync pulls, acknowledge checkpoints, or
+implement recovery or key-rotation transitions. Milestone 2 (Snapshot and incremental
+pull with acknowledgements) is the immediate next implementation priority.
 
 ## Working agreements
 
@@ -48,7 +43,7 @@ not covered by this check.
 
 ## Milestones
 
-### 0. Establish a repeatable test environment
+### 0. Establish a repeatable test environment (Completed)
 
 1. Add a locked dependency graph (`Cargo.lock`) and CI for formatting, clippy,
    unit tests, migrations, and PostgreSQL integration tests.
@@ -61,7 +56,7 @@ not covered by this check.
 migrations apply in CI, and at least one successful and rejected signed request
 is covered end to end.
 
-### 1. Encrypted item writes and idempotency
+### 1. Encrypted item writes and idempotency (Completed)
 
 Implement `/v1/sync/batch` and the schema from plan §§4, 9, and 10 before pull
 pages. Add `items`, immutable `item_changes`, permanent `retired_item_ids`, and

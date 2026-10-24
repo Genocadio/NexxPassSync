@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{error::AppError, state::AppState};
 
-const BODY_LIMIT: usize = 128 * 1024;
+const BODY_LIMIT: usize = 1024 * 1024;
 const NONCE_TTL_HOURS: i64 = 48;
 const TIMESTAMP_WINDOW_SECONDS: u64 = 300;
 
