@@ -128,3 +128,47 @@ fn test_signature_verification_vector() {
         sig_obj["body_sha256_hex"].as_str().unwrap()
     );
 }
+
+#[test]
+fn test_page_receipt_vector() {
+    let fixture = load_fixture();
+    let account_id = hex_to_bytes(fixture["account"]["id_hex"].as_str().unwrap());
+    let device_id = Uuid::parse_str(fixture["inputs"]["device_id"].as_str().unwrap()).unwrap();
+    let session_id = Uuid::parse_str(fixture["inputs"]["session_id"].as_str().unwrap()).unwrap();
+    let token_key_bytes = hex_to_bytes(fixture["inputs"]["token_hmac_key_hex"].as_str().unwrap());
+    let token_key: [u8; 32] = token_key_bytes.as_slice().try_into().unwrap();
+
+    let receipt_obj = &fixture["page_receipt"];
+    let page_number = receipt_obj["page_number"].as_u64().unwrap() as u32;
+    let terminal_seq = receipt_obj["terminal_seq"].as_u64().unwrap();
+    let expected_b64u = receipt_obj["bytes_b64u"].as_str().unwrap();
+
+    let encoded = nexxpass_sync_server::pull::encode_page_receipt(
+        &token_key,
+        &account_id,
+        &device_id,
+        &nexxpass_sync_server::pull::PageReceiptData {
+            rv: 1,
+            session_id,
+            page_number,
+            terminal_seq,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(encoded, expected_b64u);
+
+    // Verify decoding
+    let decoded = nexxpass_sync_server::pull::decode_page_receipt(
+        &token_key,
+        &account_id,
+        &device_id,
+        &encoded,
+    )
+    .unwrap();
+
+    assert_eq!(decoded.rv, 1);
+    assert_eq!(decoded.session_id, session_id);
+    assert_eq!(decoded.page_number, page_number);
+    assert_eq!(decoded.terminal_seq, terminal_seq);
+}

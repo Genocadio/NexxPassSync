@@ -12,15 +12,17 @@ The Rust/Axum/PostgreSQL service implements signed account registration,
 authenticated `GET /v1/accounts/me`, request replay protection, device
 pairing, and encrypted item batch mutations (`POST /v1/sync/batch`).
 
-Milestone 0 and Milestone 1 are complete:
+Milestone 0, Milestone 1, and Milestone 2 are complete:
 - Locked dependencies in `Cargo.lock` and `.github/workflows/ci.yml` providing automated CI checks across formatting (`cargo fmt --check`), strict clippy lints (`-D warnings`), protocol specification vectors (`tests/vectors.rs`), and end-to-end PostgreSQL integration testing (`tests/integration.rs`).
-- Normative vectors from `protocol-v1.json` are verified directly: operation hash calculation for both `put` and `delete`, device public key digest calculation, and raw body signature canonicalization.
+- Normative vectors from `protocol-v1.json` are verified directly: operation hash calculation for both `put` and `delete`, page receipt generation and verification, device public key digest calculation, and raw body signature canonicalization.
 - Additive database migration `0004_items_and_sync_batch.sql` establishes `items`, immutable `item_changes`, permanent `retired_item_ids`, and `operations` with retention indexes and blob size constraints (552 to 65536 bytes).
 - `/v1/sync/batch` handles up to 100 operations in request order under single account-row locking (`SELECT ... FOR UPDATE`), strictly rejects duplicate `operation_id` or `item_id` within a batch, validates key versions against rotation state and write-freeze (`master_password_change`), performs canonical binary `NPSOp1` operation hashing, provides exact retry idempotency, rejects operation ID reuse with changed payload (HTTP 422 `operation_id_reused`), and enforces monotonic version/sequence progression and permanent UUID retirement upon deletion.
+- Additive database migration `0005_sync_sessions.sql` creates `sync_sessions` tracking fixed high watermarks, server-issued page positions, and one-use receipts.
+- `/v1/sync/pull` and `/v1/sync/ack` implement server-bound snapshots and incremental pulls: lock-free watermark capture $H$, crypto-spec §13 HMAC-SHA256 continuation tokens and page receipts, tombstone omission on full snapshots and inclusion on incrementals, multi-page pagination, strict out-of-order receipt rejection, idempotent ack retries, and setting `first_sync_at` upon full snapshot completion.
 
-The backend does not yet serve sync pulls, acknowledge checkpoints, or
-implement recovery or key-rotation transitions. Milestone 2 (Snapshot and incremental
-pull with acknowledgements) is the immediate next implementation priority.
+The backend does not yet implement recovery registration/wrap reads, device
+listing/revocation, or key-rotation state machine transitions. Milestone 3
+(Device management and recovery) is the immediate next implementation priority.
 
 ## Working agreements
 
@@ -75,7 +77,7 @@ changed-operation-ID reuse is rejected; stale writes conflict; delete cannot
 resurrect an item; accepted operations get monotonic versions and account
 sequences atomically; and crash/rollback tests prove no partial mutation.
 
-### 2. Snapshot and incremental pull with acknowledgements
+### 2. Snapshot and incremental pull with acknowledgements (Completed)
 
 Implement `/v1/sync/pull` and `/v1/sync/ack` using persisted sessions, fixed high
 watermarks, server-issued page positions, continuation tokens, and one-use page

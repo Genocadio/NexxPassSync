@@ -91,6 +91,8 @@ async fn test_full_batch_sync_lifecycle() {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         database_url,
         database_max_connections: 5,
+        token_hmac_key: [0x55; 32],
+        deployment_epoch: 1,
     };
 
     let state = match AppState::connect(&config).await {
@@ -311,4 +313,452 @@ async fn test_full_batch_sync_lifecycle() {
     let rev_response: BatchResponse = serde_json::from_slice(&rev_body).unwrap();
     // Re-creating a retired item ID must be rejected as item_deleted!
     assert_eq!(rev_response.results[0].status, "item_deleted");
+
+    // --- MILESTONE 2: SNAPSHOT AND INCREMENTAL PULL WITH ACKS ---
+
+    // 1. Create a second live item so the snapshot has live content
+    let item_id_2 = Uuid::new_v4();
+    let op_id_4 = Uuid::new_v4();
+    let batch_2_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": op_id_4.to_string(),
+                "item_id": item_id_2.to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": dummy_blob,
+            }
+        ]
+    });
+    let b2_bytes = serde_json::to_vec(&batch_2_body).unwrap();
+    let b2_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &b2_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let b2_res = router.clone().oneshot(b2_req).await.unwrap();
+    assert_eq!(b2_res.status(), StatusCode::OK);
+
+    // 2. Register Device 2 via pairing flow
+    let device_key_2 = make_signing_key(0x21);
+    let device_id_2 = Uuid::new_v4();
+    let pairing_req_body = serde_json::json!({
+        "target_account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "device_id": device_id_2.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key_2.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x88; 32]),
+        "device_label": "Test Secondary Device",
+    });
+    let p_bytes = serde_json::to_vec(&pairing_req_body).unwrap();
+    let p_req = Request::builder()
+        .method("POST")
+        .uri("/v1/pairings")
+        .header("x-nexxpass-protocol", "1")
+        .header("content-type", "application/json")
+        .body(Body::from(p_bytes))
+        .unwrap();
+    let p_res = router.clone().oneshot(p_req).await.unwrap();
+    assert_eq!(p_res.status(), StatusCode::ACCEPTED);
+    let p_body = to_bytes(p_res.into_body(), 1024 * 1024).await.unwrap();
+    let challenge: serde_json::Value = serde_json::from_slice(&p_body).unwrap();
+    let pairing_id_str = challenge["pairing_id"].as_str().unwrap();
+
+    // Primary device approves pairing
+    let approval_body = serde_json::json!({
+        "pairing_id": pairing_id_str,
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "device_id": device_id_2.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key_2.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x88; 32]),
+        "expiry": challenge["expires_at"].as_str().unwrap(),
+        "active_key_version": 1,
+        "wrap": URL_SAFE_NO_PAD.encode([0x99; 105]),
+    });
+    let app_bytes = serde_json::to_vec(&approval_body).unwrap();
+    let app_req = sign_request(
+        "POST",
+        &format!("/v1/pairings/{pairing_id_str}/approve"),
+        &app_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let app_res = router.clone().oneshot(app_req).await.unwrap();
+    assert_eq!(app_res.status(), StatusCode::OK);
+
+    // 3. Device 2 performs Full Snapshot Pull (`checkpoint = 0`)
+    let pull_req_body = serde_json::json!({
+        "checkpoint": 0,
+        "page_size": 50,
+    });
+    let pull_bytes = serde_json::to_vec(&pull_req_body).unwrap();
+    let pull_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &pull_bytes,
+        &device_key_2,
+        &account_id,
+        Some(device_id_2),
+        false,
+    );
+    let pull_res = router.clone().oneshot(pull_req).await.unwrap();
+    assert_eq!(pull_res.status(), StatusCode::OK);
+    let pull_body = to_bytes(pull_res.into_body(), 1024 * 1024).await.unwrap();
+    let page: serde_json::Value = serde_json::from_slice(&pull_body).unwrap();
+
+    assert!(page["done"].as_bool().unwrap());
+    let items_array = page["items"].as_array().unwrap();
+    // Full snapshot must omit tombstones! So item_id_1 (deleted) must be absent, and item_id_2 present.
+    assert_eq!(items_array.len(), 1);
+    assert_eq!(
+        items_array[0]["item_id"].as_str().unwrap(),
+        item_id_2.to_string()
+    );
+    assert!(!items_array[0]["deleted"].as_bool().unwrap());
+
+    let session_id = page["sync_session_id"].as_str().unwrap();
+    let high_watermark = page["high_watermark"].as_u64().unwrap();
+    let receipt = page["page_receipt"].as_str().unwrap();
+
+    // 4. Device 2 acknowledges the snapshot page
+    let ack_req_body = serde_json::json!({
+        "sync_session_id": session_id,
+        "terminal_seq": high_watermark,
+        "page_receipt": receipt,
+    });
+    let ack_bytes = serde_json::to_vec(&ack_req_body).unwrap();
+    let ack_req = sign_request(
+        "POST",
+        "/v1/sync/ack",
+        &ack_bytes,
+        &device_key_2,
+        &account_id,
+        Some(device_id_2),
+        false,
+    );
+    let ack_res = router.clone().oneshot(ack_req).await.unwrap();
+    assert_eq!(ack_res.status(), StatusCode::OK);
+    let ack_body = to_bytes(ack_res.into_body(), 1024 * 1024).await.unwrap();
+    let ack_resp: serde_json::Value = serde_json::from_slice(&ack_body).unwrap();
+    assert_eq!(ack_resp["status"].as_str().unwrap(), "accepted");
+    assert_eq!(ack_resp["last_seen_seq"].as_u64().unwrap(), high_watermark);
+
+    // 5. Test Ack Idempotent Retry
+    let ack_retry_req = sign_request(
+        "POST",
+        "/v1/sync/ack",
+        &ack_bytes,
+        &device_key_2,
+        &account_id,
+        Some(device_id_2),
+        false,
+    );
+    let ack_retry_res = router.clone().oneshot(ack_retry_req).await.unwrap();
+    assert_eq!(ack_retry_res.status(), StatusCode::OK);
+    let ack_retry_body = to_bytes(ack_retry_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let ack_retry_resp: serde_json::Value = serde_json::from_slice(&ack_retry_body).unwrap();
+    assert_eq!(ack_retry_resp["status"].as_str().unwrap(), "duplicate");
+    assert_eq!(
+        ack_retry_resp["last_seen_seq"].as_u64().unwrap(),
+        high_watermark
+    );
+
+    // Verify GET /v1/accounts/me now reports device 2 with first_sync_at set!
+    let me_req_2 = sign_request(
+        "GET",
+        "/v1/accounts/me",
+        b"",
+        &device_key_2,
+        &account_id,
+        Some(device_id_2),
+        false,
+    );
+    let me_res_2 = router.clone().oneshot(me_req_2).await.unwrap();
+    assert_eq!(me_res_2.status(), StatusCode::OK);
+    let me_body_2 = to_bytes(me_res_2.into_body(), 1024 * 1024).await.unwrap();
+    let me_json_2: serde_json::Value = serde_json::from_slice(&me_body_2).unwrap();
+    assert!(me_json_2["device"]["first_sync_at"].is_string());
+    assert_eq!(
+        me_json_2["checkpoint"]["last_seen_seq"].as_u64().unwrap(),
+        high_watermark
+    );
+
+    // 6. Test Incremental Pull on Device 2
+    // Primary device writes a new item (item_id_3)
+    let item_id_3 = Uuid::new_v4();
+    let op_id_5 = Uuid::new_v4();
+    let batch_3_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": op_id_5.to_string(),
+                "item_id": item_id_3.to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": dummy_blob,
+            }
+        ]
+    });
+    let b3_bytes = serde_json::to_vec(&batch_3_body).unwrap();
+    let b3_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &b3_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let b3_res = router.clone().oneshot(b3_req).await.unwrap();
+    assert_eq!(b3_res.status(), StatusCode::OK);
+
+    // Device 2 pulls incrementally starting from its acknowledged checkpoint (high_watermark)
+    let inc_pull_body = serde_json::json!({
+        "checkpoint": high_watermark,
+        "page_size": 50,
+    });
+    let inc_bytes = serde_json::to_vec(&inc_pull_body).unwrap();
+    let inc_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &inc_bytes,
+        &device_key_2,
+        &account_id,
+        Some(device_id_2),
+        false,
+    );
+    let inc_res = router.clone().oneshot(inc_req).await.unwrap();
+    assert_eq!(inc_res.status(), StatusCode::OK);
+    let inc_page_body = to_bytes(inc_res.into_body(), 1024 * 1024).await.unwrap();
+    let inc_page: serde_json::Value = serde_json::from_slice(&inc_page_body).unwrap();
+    assert!(inc_page["done"].as_bool().unwrap());
+    let inc_items = inc_page["items"].as_array().unwrap();
+    assert_eq!(inc_items.len(), 1);
+    assert_eq!(
+        inc_items[0]["item_id"].as_str().unwrap(),
+        item_id_3.to_string()
+    );
+}
+
+#[tokio::test]
+async fn test_multipage_pull_and_continuation_token() {
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://nexxpass:change-me@localhost:5432/nexxpass_sync".to_string()
+    });
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        database_url,
+        database_max_connections: 5,
+        token_hmac_key: [0x77; 32],
+        deployment_epoch: 1,
+    };
+
+    let state = match AppState::connect(&config).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Skipping postgres integration test: {e}");
+            return;
+        }
+    };
+
+    state
+        .migrate()
+        .await
+        .expect("migrations should apply cleanly");
+
+    let router = http::router(state.clone());
+
+    let identity_key = make_signing_key(0x31);
+    let device_key = make_signing_key(0x32);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let device_id = Uuid::new_v4();
+
+    // Register account
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x55; 32]),
+        "derivation_version": 1,
+        "device": {
+            "device_id": device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x66; 32]),
+            "device_label": "Test Device MultiPage",
+            "wrap": URL_SAFE_NO_PAD.encode([0x44; 105]),
+        },
+        "recovery_wrap": URL_SAFE_NO_PAD.encode([0x33; 105]),
+    });
+    let reg_bytes = serde_json::to_vec(&reg_body).unwrap();
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &reg_bytes,
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // Create 5 items in a single batch
+    let dummy_blob = URL_SAFE_NO_PAD.encode(vec![0xaa; 600]);
+    let mut ops = Vec::new();
+    for _ in 0..5 {
+        ops.push(serde_json::json!({
+            "op": "put",
+            "operation_id": Uuid::new_v4().to_string(),
+            "item_id": Uuid::new_v4().to_string(),
+            "base_version": 0,
+            "key_version": 1,
+            "blob": dummy_blob,
+        }));
+    }
+    let batch_req_body = serde_json::json!({ "operations": ops });
+    let batch_bytes = serde_json::to_vec(&batch_req_body).unwrap();
+    let batch_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &batch_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let batch_res = router.clone().oneshot(batch_req).await.unwrap();
+    assert_eq!(batch_res.status(), StatusCode::OK);
+
+    // Page 1: Request with page_size = 2
+    let p1_body = serde_json::json!({ "checkpoint": 0, "page_size": 2 });
+    let p1_bytes = serde_json::to_vec(&p1_body).unwrap();
+    let p1_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &p1_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let p1_res = router.clone().oneshot(p1_req).await.unwrap();
+    assert_eq!(p1_res.status(), StatusCode::OK);
+    let p1_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(p1_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(p1_json["items"].as_array().unwrap().len(), 2);
+    assert!(!p1_json["done"].as_bool().unwrap());
+    let token_1 = p1_json["continuation_token"].as_str().unwrap();
+    let session_id = p1_json["sync_session_id"].as_str().unwrap();
+    let receipt_1 = p1_json["page_receipt"].as_str().unwrap();
+
+    // Acknowledge Page 1
+    let ack_1_body = serde_json::json!({
+        "sync_session_id": session_id,
+        "terminal_seq": p1_json["page_cursor"].as_u64().unwrap(),
+        "page_receipt": receipt_1,
+    });
+    let ack_1_req = sign_request(
+        "POST",
+        "/v1/sync/ack",
+        &serde_json::to_vec(&ack_1_body).unwrap(),
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let ack_1_res = router.clone().oneshot(ack_1_req).await.unwrap();
+    assert_eq!(ack_1_res.status(), StatusCode::OK);
+
+    // Page 2: Continue using token_1
+    let p2_body = serde_json::json!({ "continuation_token": token_1 });
+    let p2_bytes = serde_json::to_vec(&p2_body).unwrap();
+    let p2_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &p2_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let p2_res = router.clone().oneshot(p2_req).await.unwrap();
+    assert_eq!(p2_res.status(), StatusCode::OK);
+    let p2_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(p2_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(p2_json["items"].as_array().unwrap().len(), 2);
+    assert!(!p2_json["done"].as_bool().unwrap());
+    let token_2 = p2_json["continuation_token"].as_str().unwrap();
+    let receipt_2 = p2_json["page_receipt"].as_str().unwrap();
+
+    // Acknowledge Page 2
+    let ack_2_body = serde_json::json!({
+        "sync_session_id": session_id,
+        "terminal_seq": p2_json["page_cursor"].as_u64().unwrap(),
+        "page_receipt": receipt_2,
+    });
+    let ack_2_req = sign_request(
+        "POST",
+        "/v1/sync/ack",
+        &serde_json::to_vec(&ack_2_body).unwrap(),
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let ack_2_res = router.clone().oneshot(ack_2_req).await.unwrap();
+    assert_eq!(ack_2_res.status(), StatusCode::OK);
+
+    // Page 3: Final page using token_2
+    let p3_body = serde_json::json!({ "continuation_token": token_2 });
+    let p3_bytes = serde_json::to_vec(&p3_body).unwrap();
+    let p3_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &p3_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let p3_res = router.clone().oneshot(p3_req).await.unwrap();
+    assert_eq!(p3_res.status(), StatusCode::OK);
+    let p3_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(p3_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(p3_json["items"].as_array().unwrap().len(), 1);
+    assert!(p3_json["done"].as_bool().unwrap());
+    assert!(p3_json["continuation_token"].is_null());
+    let receipt_3 = p3_json["page_receipt"].as_str().unwrap();
+
+    // Acknowledge Page 3
+    let ack_3_body = serde_json::json!({
+        "sync_session_id": session_id,
+        "terminal_seq": p3_json["page_cursor"].as_u64().unwrap(),
+        "page_receipt": receipt_3,
+    });
+    let ack_3_req = sign_request(
+        "POST",
+        "/v1/sync/ack",
+        &serde_json::to_vec(&ack_3_body).unwrap(),
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let ack_3_res = router.clone().oneshot(ack_3_req).await.unwrap();
+    assert_eq!(ack_3_res.status(), StatusCode::OK);
 }

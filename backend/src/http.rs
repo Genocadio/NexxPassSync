@@ -25,6 +25,8 @@ pub fn router(state: AppState) -> Router {
             post(crate::pairing::approve_pairing),
         )
         .route("/sync/batch", post(crate::sync::handle_sync_batch))
+        .route("/sync/pull", post(crate::pull::handle_sync_pull))
+        .route("/sync/ack", post(crate::pull::handle_sync_ack))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::authenticate_device,

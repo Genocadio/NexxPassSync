@@ -5,6 +5,7 @@ pub mod error;
 pub mod health;
 pub mod http;
 pub mod pairing;
+pub mod pull;
 pub mod registration;
 pub mod state;
 pub mod sync;

@@ -38,6 +38,8 @@ pub enum AppError {
     RotationInProgress,
     #[error("operation id reused with different hash")]
     OperationIdReused,
+    #[error("resync required")]
+    ResyncRequired,
     #[error("conflict")]
     Conflict,
     #[error("service unavailable")]
@@ -149,6 +151,12 @@ impl IntoResponse for AppError {
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "operation_id_reused",
                 "Operation ID was previously used with a different hash.",
+                None,
+            ),
+            Self::ResyncRequired => (
+                StatusCode::GONE,
+                "resync_required",
+                "Checkpoint is below the retained history floor.",
                 None,
             ),
             Self::Conflict => (
