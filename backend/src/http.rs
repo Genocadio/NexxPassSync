@@ -15,10 +15,33 @@ use tower_http::{
 use crate::{error::AppError, health, state::AppState};
 
 pub fn router(state: AppState) -> Router {
-    let device_routes = Router::new()
+    let authenticated_routes = Router::new()
         .route(
             "/accounts/me",
             axum::routing::get(crate::account::get_account_me),
+        )
+        .route(
+            "/accounts/recovery",
+            axum::routing::get(crate::device::get_recovery_wraps),
+        )
+        .route("/accounts/lock", post(crate::device::lock_account))
+        .route("/accounts/migrate", post(crate::device::migrate_identity))
+        .route(
+            "/accounts",
+            axum::routing::delete(crate::device::delete_account),
+        )
+        .route(
+            "/accounts/deletion/cancel",
+            post(crate::device::cancel_deletion),
+        )
+        .route(
+            "/devices",
+            axum::routing::get(crate::device::list_devices)
+                .post(crate::device::register_device_recovery),
+        )
+        .route(
+            "/devices/{device_id}",
+            axum::routing::delete(crate::device::revoke_device),
         )
         .route(
             "/pairings/{pairing_id}/approve",
@@ -27,6 +50,19 @@ pub fn router(state: AppState) -> Router {
         .route("/sync/batch", post(crate::sync::handle_sync_batch))
         .route("/sync/pull", post(crate::pull::handle_sync_pull))
         .route("/sync/ack", post(crate::pull::handle_sync_ack))
+        .route("/rotation/start", post(crate::rotation::start_rotation))
+        .route(
+            "/rotation/heartbeat",
+            post(crate::rotation::heartbeat_rotation),
+        )
+        .route("/rotation/resume", post(crate::rotation::resume_rotation))
+        .route("/rotation/ack", post(crate::rotation::ack_rotation))
+        .route(
+            "/rotation/complete",
+            post(crate::rotation::complete_rotation),
+        )
+        .route("/rotation/abort", post(crate::rotation::abort_rotation))
+        .route("/rotation/rewrite", post(crate::rotation::rewrite_rotation))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::authenticate_device,
@@ -34,7 +70,7 @@ pub fn router(state: AppState) -> Router {
     let api_v1 = Router::new()
         .route("/accounts", post(crate::registration::register_account))
         .route("/pairings", post(crate::pairing::create_pairing_challenge))
-        .merge(device_routes);
+        .merge(authenticated_routes);
     Router::new()
         .nest("/health", health::routes())
         .nest("/v1", api_v1)

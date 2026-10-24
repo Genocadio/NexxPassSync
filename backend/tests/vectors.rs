@@ -172,3 +172,29 @@ fn test_page_receipt_vector() {
     assert_eq!(decoded.page_number, page_number);
     assert_eq!(decoded.terminal_seq, terminal_seq);
 }
+
+#[test]
+fn test_identity_migration_countersign_preimage() {
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let old_identity_key = SigningKey::from_bytes(&[0x42; 32]);
+    let account_id = [0x99; 32];
+    let body_bytes = b"{\"identity_ed25519_pub\":\"test\"}";
+
+    let body_hash_hex: String = Sha256::digest(body_bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mut preimage = Vec::with_capacity(9 + 32 + 64);
+    preimage.extend_from_slice(b"NPSIdMig1");
+    preimage.extend_from_slice(&account_id);
+    preimage.extend_from_slice(body_hash_hex.as_bytes());
+
+    assert_eq!(preimage.len(), 105);
+    assert_eq!(&preimage[0..9], b"NPSIdMig1");
+    assert_eq!(&preimage[9..41], &account_id);
+
+    let signature = old_identity_key.sign(&preimage);
+    let verifying_key = old_identity_key.verifying_key();
+    assert!(verifying_key.verify_strict(&preimage, &signature).is_ok());
+}

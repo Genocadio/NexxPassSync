@@ -14,8 +14,8 @@ use crate::{
 };
 
 const MAX_BATCH_OPERATIONS: usize = 100;
-const MIN_BLOB_BYTES: usize = 552;
-const MAX_BLOB_BYTES: usize = 65536;
+pub(crate) const MIN_BLOB_BYTES: usize = 552;
+pub(crate) const MAX_BLOB_BYTES: usize = 65536;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -526,7 +526,7 @@ pub async fn handle_sync_batch(
     Ok(Json(BatchResponse { results }))
 }
 
-fn parse_canonical_uuid(value: &str) -> Result<Uuid, AppError> {
+pub(crate) fn parse_canonical_uuid(value: &str) -> Result<Uuid, AppError> {
     let uuid = Uuid::parse_str(value).map_err(|_| AppError::InvalidInput)?;
     if uuid.to_string() != value || uuid.get_version_num() != 4 {
         return Err(AppError::InvalidInput);

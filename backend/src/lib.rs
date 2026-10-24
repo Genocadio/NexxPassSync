@@ -1,11 +1,14 @@
 pub mod account;
 pub mod auth;
 pub mod config;
+pub mod device;
 pub mod error;
 pub mod health;
 pub mod http;
+pub mod maintenance;
 pub mod pairing;
 pub mod pull;
 pub mod registration;
+pub mod rotation;
 pub mod state;
 pub mod sync;

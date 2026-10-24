@@ -42,6 +42,8 @@ pub enum AppError {
     ResyncRequired,
     #[error("conflict")]
     Conflict,
+    #[error("not found")]
+    NotFound,
     #[error("service unavailable")]
     Unavailable,
 }
@@ -163,6 +165,12 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 "conflict",
                 "The request conflicts with existing account state.",
+                None,
+            ),
+            Self::NotFound => (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Resource not found.",
                 None,
             ),
             Self::Unavailable => (

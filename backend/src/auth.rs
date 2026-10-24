@@ -51,7 +51,9 @@ pub async fn authenticate_device(
     if original_uri.query().is_some() || !canonical_path(original_uri.path()) {
         return Err(AppError::MalformedRequest);
     }
-    if headers.contains_key("x-nexxpass-countersign") {
+    if headers.contains_key("x-nexxpass-countersign")
+        && original_uri.path() != "/v1/accounts/migrate"
+    {
         return Err(AppError::MalformedRequest);
     }
 
@@ -297,7 +299,7 @@ fn unique_header<'a>(
         .map_err(|_| AppError::MalformedRequest)
 }
 
-fn decode_exact(value: &str, expected: usize) -> Result<Vec<u8>, AppError> {
+pub(crate) fn decode_exact(value: &str, expected: usize) -> Result<Vec<u8>, AppError> {
     let decoded = URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| AppError::MalformedRequest)?;
@@ -351,7 +353,7 @@ fn is_unreserved(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)
 }
 
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

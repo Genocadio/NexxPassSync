@@ -762,3 +762,672 @@ async fn test_multipage_pull_and_continuation_token() {
     let ack_3_res = router.clone().oneshot(ack_3_req).await.unwrap();
     assert_eq!(ack_3_res.status(), StatusCode::OK);
 }
+
+fn sign_identity_request(
+    method: &str,
+    path: &str,
+    body_bytes: &[u8],
+    signing_key: &SigningKey,
+    account_id: &[u8],
+) -> Request<Body> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let nonce: [u8; 16] = Uuid::new_v4().as_bytes().to_owned();
+    let nonce_b64u = URL_SAFE_NO_PAD.encode(nonce);
+
+    let mut body_hasher = Sha256::new();
+    body_hasher.update(body_bytes);
+    let body_digest_hex = hex_lower(&body_hasher.finalize());
+
+    let canonical = format!(
+        "NPSSv1\n{}\n{}\n\n{}\n{}\n{}",
+        method, path, now, nonce_b64u, body_digest_hex
+    );
+
+    let signature = signing_key.sign(canonical.as_bytes());
+    let sig_b64u = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-nexxpass-protocol", "1")
+        .header("x-nexxpass-timestamp", now.to_string())
+        .header("x-nexxpass-nonce", nonce_b64u)
+        .header("x-nexxpass-signature", sig_b64u)
+        .header("x-nexxpass-account", URL_SAFE_NO_PAD.encode(account_id))
+        .header("x-nexxpass-key", "identity");
+
+    if !body_bytes.is_empty() {
+        builder = builder.header("content-type", "application/json");
+    }
+
+    builder.body(Body::from(body_bytes.to_vec())).unwrap()
+}
+
+async fn setup_test_app() -> (axum::Router, AppState) {
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://nexxpass:change-me@localhost:5432/nexxpass_sync".to_string()
+    });
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        database_url,
+        database_max_connections: 5,
+        token_hmac_key: [0x55; 32],
+        deployment_epoch: 1,
+    };
+
+    let state = AppState::connect(&config).await.expect("connect db");
+    state.migrate().await.expect("apply migrations");
+    let router = http::router(state.clone());
+    (router, state)
+}
+
+#[tokio::test]
+async fn test_device_management_and_recovery_lifecycle() {
+    let (router, _state) = setup_test_app().await;
+
+    let identity_key = make_signing_key(0x31);
+    let device_key = make_signing_key(0x32);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let device_id = Uuid::new_v4();
+
+    let wrap_105 = [0x77u8; 105];
+    let wrap_b64u = URL_SAFE_NO_PAD.encode(wrap_105);
+
+    // 1. Register account
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1",
+            "wrap": wrap_b64u,
+        }
+    });
+
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // 2. Read recovery wraps via GET /v1/accounts/recovery (identity-signed)
+    let rec_req = sign_identity_request(
+        "GET",
+        "/v1/accounts/recovery",
+        &[],
+        &identity_key,
+        &account_id,
+    );
+    let rec_res = router.clone().oneshot(rec_req).await.unwrap();
+    assert_eq!(rec_res.status(), StatusCode::OK);
+    let rec_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rec_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let wraps = rec_json["wraps"].as_array().unwrap();
+    assert_eq!(wraps.len(), 1);
+    assert_eq!(wraps[0]["recipient"].as_str().unwrap(), "recovery");
+    assert_eq!(wraps[0]["status"].as_str().unwrap(), "active");
+
+    // 3. Register Device 2 via recovery phrase (POST /v1/devices, identity-signed)
+    let device_2_key = make_signing_key(0x33);
+    let device_2_id = Uuid::new_v4();
+    let dev2_body = serde_json::json!({
+        "device_id": device_2_id.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_2_key.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x55u8; 32]),
+        "device_label": "Device 2 Recovery",
+        "wrap": wrap_b64u,
+    });
+    let dev2_req = sign_identity_request(
+        "POST",
+        "/v1/devices",
+        &serde_json::to_vec(&dev2_body).unwrap(),
+        &identity_key,
+        &account_id,
+    );
+    let dev2_res = router.clone().oneshot(dev2_req).await.unwrap();
+    assert_eq!(dev2_res.status(), StatusCode::CREATED);
+
+    // 4. List devices via GET /v1/devices (device-signed by device 1)
+    let list_req = sign_request(
+        "GET",
+        "/v1/devices",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let list_res = router.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_res.status(), StatusCode::OK);
+    let list_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let dev_list = list_json["devices"].as_array().unwrap();
+    assert_eq!(dev_list.len(), 2);
+
+    // 5. Revoke Device 2 via DELETE /v1/devices/{device_id}
+    let revoke_path = format!("/v1/devices/{device_2_id}");
+    let revoke_req = sign_request(
+        "DELETE",
+        &revoke_path,
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let revoke_res = router.clone().oneshot(revoke_req).await.unwrap();
+    assert_eq!(revoke_res.status(), StatusCode::OK);
+
+    // Device 2 is now rejected
+    let d2_req = sign_request(
+        "GET",
+        "/v1/devices",
+        &[],
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let d2_res = router.clone().oneshot(d2_req).await.unwrap();
+    assert_eq!(d2_res.status(), StatusCode::FORBIDDEN);
+
+    // 6. Lock identity via POST /v1/accounts/lock
+    let lock_req = sign_request(
+        "POST",
+        "/v1/accounts/lock",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let lock_res = router.clone().oneshot(lock_req).await.unwrap();
+    assert_eq!(lock_res.status(), StatusCode::OK);
+
+    // Identity-signed requests now return identity_locked (403)
+    let locked_rec_req = sign_identity_request(
+        "GET",
+        "/v1/accounts/recovery",
+        &[],
+        &identity_key,
+        &account_id,
+    );
+    let locked_rec_res = router.clone().oneshot(locked_rec_req).await.unwrap();
+    assert_eq!(locked_rec_res.status(), StatusCode::FORBIDDEN);
+
+    // Device 1 continues to work
+    let me_req = sign_request(
+        "GET",
+        "/v1/accounts/me",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let me_res = router.clone().oneshot(me_req).await.unwrap();
+    assert_eq!(me_res.status(), StatusCode::OK);
+    let me_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(me_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(me_json["status"].as_str().unwrap(), "identity_locked");
+
+    // 7. In-place identity migration via POST /v1/accounts/migrate
+    let new_identity_key = make_signing_key(0x34);
+    let new_recovery_wrap = [0x88u8; 105];
+    let new_wrap_b64u = URL_SAFE_NO_PAD.encode(new_recovery_wrap);
+
+    let mig_body = serde_json::json!({
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(new_identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x66u8; 32]),
+        "derivation_version": 2,
+        "recovery_wraps": [
+            {
+                "key_version": 1,
+                "wrap": new_wrap_b64u,
+            }
+        ]
+    });
+    let mig_bytes = serde_json::to_vec(&mig_body).unwrap();
+
+    // Compute countersignature by old identity key
+    let body_hash_hex = hex_lower(&Sha256::digest(&mig_bytes));
+    let mut preimage = Vec::with_capacity(9 + 32 + 64);
+    preimage.extend_from_slice(b"NPSIdMig1");
+    preimage.extend_from_slice(&account_id);
+    preimage.extend_from_slice(body_hash_hex.as_bytes());
+    let countersig = identity_key.sign(&preimage);
+    let countersig_b64u = URL_SAFE_NO_PAD.encode(countersig.to_bytes());
+
+    let mut mig_req = sign_request(
+        "POST",
+        "/v1/accounts/migrate",
+        &mig_bytes,
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    mig_req
+        .headers_mut()
+        .insert("x-nexxpass-countersign", countersig_b64u.parse().unwrap());
+
+    let mig_res = router.clone().oneshot(mig_req).await.unwrap();
+    assert_eq!(mig_res.status(), StatusCode::OK);
+
+    // Old identity key is rejected
+    let old_rec_req = sign_identity_request(
+        "GET",
+        "/v1/accounts/recovery",
+        &[],
+        &identity_key,
+        &account_id,
+    );
+    let old_rec_res = router.clone().oneshot(old_rec_req).await.unwrap();
+    assert_eq!(old_rec_res.status(), StatusCode::UNAUTHORIZED);
+
+    // New identity key succeeds!
+    let new_rec_req = sign_identity_request(
+        "GET",
+        "/v1/accounts/recovery",
+        &[],
+        &new_identity_key,
+        &account_id,
+    );
+    let new_rec_res = router.clone().oneshot(new_rec_req).await.unwrap();
+    assert_eq!(new_rec_res.status(), StatusCode::OK);
+    let new_rec_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(new_rec_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let new_wraps = new_rec_json["wraps"].as_array().unwrap();
+    assert_eq!(new_wraps.len(), 1);
+    assert_eq!(new_wraps[0]["wrap"].as_str().unwrap(), new_wrap_b64u);
+
+    // 8. Request account deletion via DELETE /v1/accounts
+    let del_req = sign_identity_request(
+        "DELETE",
+        "/v1/accounts",
+        &[],
+        &new_identity_key,
+        &account_id,
+    );
+    let del_res = router.clone().oneshot(del_req).await.unwrap();
+    assert_eq!(del_res.status(), StatusCode::OK);
+    let del_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(del_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(del_json["status"].as_str().unwrap(), "deletion_pending");
+    assert!(del_json["deletion_requested_at"].is_string());
+
+    // 9. Cancel account deletion via POST /v1/accounts/deletion/cancel
+    let cancel_req = sign_request(
+        "POST",
+        "/v1/accounts/deletion/cancel",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let cancel_res = router.clone().oneshot(cancel_req).await.unwrap();
+    assert_eq!(cancel_res.status(), StatusCode::OK);
+    let cancel_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(cancel_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(cancel_json["status"].as_str().unwrap(), "active");
+}
+
+#[tokio::test]
+async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
+    let (router, _state) = setup_test_app().await;
+
+    let identity_key = make_signing_key(0x41);
+    let device_1_key = make_signing_key(0x42);
+    let device_2_key = make_signing_key(0x43);
+
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let device_1_id = Uuid::new_v4();
+    let device_2_id = Uuid::new_v4();
+
+    let wrap_105 = [0x77u8; 105];
+    let wrap_b64u = URL_SAFE_NO_PAD.encode(wrap_105);
+
+    // 1. Register account with device 1
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_1_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_1_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1",
+            "wrap": wrap_b64u,
+        }
+    });
+
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // 2. Register Device 2 via recovery
+    let dev2_body = serde_json::json!({
+        "device_id": device_2_id.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_2_key.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x55u8; 32]),
+        "device_label": "Device 2",
+        "wrap": wrap_b64u,
+    });
+    let dev2_req = sign_identity_request(
+        "POST",
+        "/v1/devices",
+        &serde_json::to_vec(&dev2_body).unwrap(),
+        &identity_key,
+        &account_id,
+    );
+    let dev2_res = router.clone().oneshot(dev2_req).await.unwrap();
+    assert_eq!(dev2_res.status(), StatusCode::CREATED);
+
+    // 3. Start Routine Rotation (POST /v1/rotation/start)
+    let target_wrap = [0x88u8; 105];
+    let target_wrap_b64u = URL_SAFE_NO_PAD.encode(target_wrap);
+
+    let start_body = serde_json::json!({
+        "mode": "routine",
+        "recovery_wrap": target_wrap_b64u,
+        "device_wraps": [
+            { "device_id": device_1_id.to_string(), "wrap": target_wrap_b64u },
+            { "device_id": device_2_id.to_string(), "wrap": target_wrap_b64u },
+        ]
+    });
+    let start_req = sign_request(
+        "POST",
+        "/v1/rotation/start",
+        &serde_json::to_vec(&start_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let start_res = router.clone().oneshot(start_req).await.unwrap();
+    assert_eq!(start_res.status(), StatusCode::OK);
+    let start_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(start_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(start_json["mode"].as_str().unwrap(), "routine");
+    assert_eq!(start_json["target_key_version"].as_i64().unwrap(), 2);
+
+    // 4. Heartbeat lease
+    let hb_req = sign_request(
+        "POST",
+        "/v1/rotation/heartbeat",
+        &[],
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let hb_res = router.clone().oneshot(hb_req).await.unwrap();
+    assert_eq!(hb_res.status(), StatusCode::OK);
+
+    // 5. Abort routine rotation
+    let abort_req = sign_request(
+        "POST",
+        "/v1/rotation/abort",
+        &[],
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let abort_res = router.clone().oneshot(abort_req).await.unwrap();
+    assert_eq!(abort_res.status(), StatusCode::OK);
+    let abort_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(abort_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(abort_json["mode"].as_str().unwrap(), "idle");
+
+    // 6. Start Master Password Change rotation
+    // Note: target_key_version should now be 3 (since version 2 was retired).
+    let mpc_start_body = serde_json::json!({
+        "mode": "master_password_change",
+        "recovery_wrap": target_wrap_b64u,
+        "device_wraps": [
+            { "device_id": device_1_id.to_string(), "wrap": target_wrap_b64u },
+            { "device_id": device_2_id.to_string(), "wrap": target_wrap_b64u },
+        ]
+    });
+    let mpc_start_req = sign_request(
+        "POST",
+        "/v1/rotation/start",
+        &serde_json::to_vec(&mpc_start_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let mpc_start_res = router.clone().oneshot(mpc_start_req).await.unwrap();
+    assert_eq!(mpc_start_res.status(), StatusCode::OK);
+    let mpc_start_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(mpc_start_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        mpc_start_json["mode"].as_str().unwrap(),
+        "master_password_change"
+    );
+    assert_eq!(mpc_start_json["target_key_version"].as_i64().unwrap(), 3);
+    assert!(mpc_start_json["writes_frozen"].as_bool().unwrap());
+
+    // 7. Normal writes are frozen
+    let item_uuid = Uuid::new_v4();
+    let blob_bytes = vec![0x99u8; 600];
+    let blob_b64u = URL_SAFE_NO_PAD.encode(&blob_bytes);
+    let batch_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": item_uuid.to_string(),
+                "base_version": 0,
+                "key_version": 3,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let frozen_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&batch_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let frozen_res = router.clone().oneshot(frozen_req).await.unwrap();
+    assert_eq!(frozen_res.status(), StatusCode::CONFLICT); // rotation_in_progress
+
+    // 8. Lease owner rewrites via POST /v1/rotation/rewrite
+    let rewrite_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": item_uuid.to_string(),
+                "base_version": 0,
+                "key_version": 3,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let rewrite_req = sign_request(
+        "POST",
+        "/v1/rotation/rewrite",
+        &serde_json::to_vec(&rewrite_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let rewrite_res = router.clone().oneshot(rewrite_req).await.unwrap();
+    assert_eq!(rewrite_res.status(), StatusCode::OK);
+    let rewrite_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(rewrite_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        rewrite_json["results"][0]["status"].as_str().unwrap(),
+        "applied"
+    );
+
+    // 9. Attempt complete before acks (fails with conflict)
+    let premature_comp_req = sign_request(
+        "POST",
+        "/v1/rotation/complete",
+        &[],
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let premature_comp_res = router.clone().oneshot(premature_comp_req).await.unwrap();
+    assert_eq!(premature_comp_res.status(), StatusCode::CONFLICT);
+
+    // 10. Acks from both devices
+    let ack_1_body = serde_json::json!({
+        "key_version": 3,
+        "local_master_password_updated": true,
+    });
+    let ack_1_req = sign_request(
+        "POST",
+        "/v1/rotation/ack",
+        &serde_json::to_vec(&ack_1_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let ack_1_res = router.clone().oneshot(ack_1_req).await.unwrap();
+    assert_eq!(ack_1_res.status(), StatusCode::OK);
+
+    let ack_2_body = serde_json::json!({
+        "key_version": 3,
+        "local_master_password_updated": true,
+    });
+    let ack_2_req = sign_request(
+        "POST",
+        "/v1/rotation/ack",
+        &serde_json::to_vec(&ack_2_body).unwrap(),
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let ack_2_res = router.clone().oneshot(ack_2_req).await.unwrap();
+    assert_eq!(ack_2_res.status(), StatusCode::OK);
+
+    // 11. Complete rotation
+    let comp_req = sign_request(
+        "POST",
+        "/v1/rotation/complete",
+        &[],
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let comp_res = router.clone().oneshot(comp_req).await.unwrap();
+    assert_eq!(comp_res.status(), StatusCode::OK);
+    let comp_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(comp_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(comp_json["mode"].as_str().unwrap(), "idle");
+    assert_eq!(comp_json["active_key_version"].as_i64().unwrap(), 3);
+    assert!(!comp_json["writes_frozen"].as_bool().unwrap());
+
+    // 12. Normal writes are now unfrozen under active key version 3
+    let unfrozen_item_uuid = Uuid::new_v4();
+    let unfrozen_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": unfrozen_item_uuid.to_string(),
+                "base_version": 0,
+                "key_version": 3,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let unfrozen_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&unfrozen_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let unfrozen_res = router.clone().oneshot(unfrozen_req).await.unwrap();
+    assert_eq!(unfrozen_res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_background_maintenance_jobs() {
+    let (_router, state) = setup_test_app().await;
+
+    let pool = &state.database;
+
+    // Run maintenance
+    let stats = nexxpass_sync_server::maintenance::run_maintenance(pool)
+        .await
+        .expect("maintenance should run cleanly");
+
+    // Verify stats structure returned
+    println!("Maintenance stats: {:?}", stats);
+}
