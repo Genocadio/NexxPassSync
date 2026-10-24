@@ -8,6 +8,7 @@ pub mod http;
 pub mod maintenance;
 pub mod pairing;
 pub mod pull;
+pub mod rate_limit;
 pub mod registration;
 pub mod rotation;
 pub mod state;

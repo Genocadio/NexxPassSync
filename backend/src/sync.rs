@@ -16,6 +16,8 @@ use crate::{
 const MAX_BATCH_OPERATIONS: usize = 100;
 pub(crate) const MIN_BLOB_BYTES: usize = 552;
 pub(crate) const MAX_BLOB_BYTES: usize = 65536;
+pub(crate) const MAX_LIVE_ITEMS: i64 = 25_000;
+pub(crate) const MAX_CIPHERTEXT_BYTES: i64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -245,6 +247,14 @@ pub async fn handle_sync_batch(
     let mut seq_counter: i64 = account_row.try_get("seq_counter")?;
     let initial_seq_counter = seq_counter;
 
+    let (mut current_live_items, mut current_ciphertext_bytes): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COALESCE(SUM(octet_length(blob)), 0)::bigint \
+         FROM items WHERE account_id = $1 AND deleted = FALSE",
+    )
+    .bind(&account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
     let mut results = Vec::with_capacity(validated_mutations.len());
 
     for mutation in validated_mutations {
@@ -316,7 +326,8 @@ pub async fn handle_sync_batch(
 
         // Lookup current item state.
         let current_item = sqlx::query(
-            "SELECT version, seq, deleted FROM items WHERE account_id = $1 AND item_id = $2",
+            "SELECT version, seq, deleted, octet_length(blob) AS blob_len \
+             FROM items WHERE account_id = $1 AND item_id = $2",
         )
         .bind(&account_id)
         .bind(mutation.item_id)
@@ -329,6 +340,34 @@ pub async fn handle_sync_batch(
                 decoded_blob,
                 ..
             } => {
+                let old_blob_len: i64 = match &current_item {
+                    Some(row) => {
+                        let is_del: bool = row.try_get("deleted")?;
+                        if is_del {
+                            0
+                        } else {
+                            row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64
+                        }
+                    }
+                    None => 0,
+                };
+                let is_new_item = match &current_item {
+                    Some(row) => row.try_get::<bool, _>("deleted")?,
+                    None => true,
+                };
+                if is_new_item && current_live_items + 1 > MAX_LIVE_ITEMS {
+                    return Err(AppError::QuotaExceeded);
+                }
+                let new_blob_len = decoded_blob.len() as i64;
+                let net_diff = new_blob_len - old_blob_len;
+                if current_ciphertext_bytes + net_diff > MAX_CIPHERTEXT_BYTES {
+                    return Err(AppError::QuotaExceeded);
+                }
+                if is_new_item {
+                    current_live_items += 1;
+                }
+                current_ciphertext_bytes += net_diff;
+
                 let next_version = if let Some(item_row) = current_item {
                     let is_deleted: bool = item_row.try_get("deleted")?;
                     if is_deleted {
@@ -455,6 +494,11 @@ pub async fn handle_sync_batch(
                     });
                     continue;
                 }
+
+                let old_blob_len: i64 =
+                    item_row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64;
+                current_live_items = current_live_items.saturating_sub(1);
+                current_ciphertext_bytes = current_ciphertext_bytes.saturating_sub(old_blob_len);
 
                 let next_version = (current_version + 1) as u64;
                 seq_counter += 1;

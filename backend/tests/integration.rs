@@ -93,6 +93,7 @@ async fn test_full_batch_sync_lifecycle() {
         database_max_connections: 5,
         token_hmac_key: [0x55; 32],
         deployment_epoch: 1,
+        maintenance_interval_seconds: 3600,
     };
 
     let state = match AppState::connect(&config).await {
@@ -560,6 +561,7 @@ async fn test_multipage_pull_and_continuation_token() {
         database_max_connections: 5,
         token_hmac_key: [0x77; 32],
         deployment_epoch: 1,
+        maintenance_interval_seconds: 3600,
     };
 
     let state = match AppState::connect(&config).await {
@@ -817,6 +819,7 @@ async fn setup_test_app() -> (axum::Router, AppState) {
         database_max_connections: 5,
         token_hmac_key: [0x55; 32],
         deployment_epoch: 1,
+        maintenance_interval_seconds: 3600,
     };
 
     let state = AppState::connect(&config).await.expect("connect db");
@@ -1430,4 +1433,151 @@ async fn test_background_maintenance_jobs() {
 
     // Verify stats structure returned
     println!("Maintenance stats: {:?}", stats);
+}
+
+#[tokio::test]
+async fn test_rate_limiting_pairing() {
+    let (router, _state) = setup_test_app().await;
+
+    let target_account_id = [0x55u8; 32];
+    let device_key = make_signing_key(0x56);
+    let device_pub_b64u = URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes());
+    let x25519_b64u = URL_SAFE_NO_PAD.encode([0x57u8; 32]);
+
+    for i in 0..20 {
+        let dev_id = Uuid::new_v4();
+        let body = serde_json::json!({
+            "target_account_id": URL_SAFE_NO_PAD.encode(target_account_id),
+            "device_id": dev_id.to_string(),
+            "device_ed25519_pub": device_pub_b64u,
+            "device_x25519_pub": x25519_b64u,
+            "device_label": format!("Device {i}"),
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/pairings")
+            .header("x-nexxpass-protocol", "1")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+    }
+
+    // 21st request exceeds rate limit (20 req / minute)
+    let dev_id = Uuid::new_v4();
+    let body = serde_json::json!({
+        "target_account_id": URL_SAFE_NO_PAD.encode(target_account_id),
+        "device_id": dev_id.to_string(),
+        "device_ed25519_pub": device_pub_b64u,
+        "device_x25519_pub": x25519_b64u,
+        "device_label": "Device 21",
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/pairings")
+        .header("x-nexxpass-protocol", "1")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let res = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(res.headers().contains_key("retry-after"));
+    let err_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(err_json["error"]["code"].as_str().unwrap(), "rate_limited");
+}
+
+#[tokio::test]
+async fn test_active_device_quota() {
+    let (router, _state) = setup_test_app().await;
+
+    let identity_key = make_signing_key(0x61);
+    let device_key = make_signing_key(0x62);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<u8>>()
+        .try_into()
+        .unwrap();
+    let device_id = Uuid::new_v4();
+    let wrap_b64u = URL_SAFE_NO_PAD.encode([0x77u8; 105]);
+
+    // 1. Register account with first device (count = 1)
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1",
+            "wrap": wrap_b64u,
+        }
+    });
+
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // 2. Register 9 more devices via recovery (total reaches 10)
+    for i in 2..=10 {
+        let dk = make_signing_key(0x70 + i as u8);
+        let did = Uuid::new_v4();
+        let dev_body = serde_json::json!({
+            "device_id": did.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(dk.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x55u8; 32]),
+            "device_label": format!("Device {i}"),
+            "wrap": wrap_b64u,
+        });
+        let req = sign_identity_request(
+            "POST",
+            "/v1/devices",
+            &serde_json::to_vec(&dev_body).unwrap(),
+            &identity_key,
+            &account_id,
+        );
+        let res = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+    }
+
+    // 3. Registering device 11 exceeds the max 10 active devices cap
+    let dk11 = make_signing_key(0x99);
+    let did11 = Uuid::new_v4();
+    let dev11_body = serde_json::json!({
+        "device_id": did11.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(dk11.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x55u8; 32]),
+        "device_label": "Device 11",
+        "wrap": wrap_b64u,
+    });
+    let req11 = sign_identity_request(
+        "POST",
+        "/v1/devices",
+        &serde_json::to_vec(&dev11_body).unwrap(),
+        &identity_key,
+        &account_id,
+    );
+    let res11 = router.clone().oneshot(req11).await.unwrap();
+    assert_eq!(res11.status(), StatusCode::TOO_MANY_REQUESTS);
+    let err_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(res11.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        err_json["error"]["code"].as_str().unwrap(),
+        "quota_exceeded"
+    );
 }

@@ -1,12 +1,13 @@
 use sqlx::{postgres::PgPoolOptions, PgPool};
 
-use crate::config::Config;
+use crate::{config::Config, rate_limit::RateLimiter};
 
 #[derive(Clone)]
 pub struct AppState {
     pub database: PgPool,
     pub token_hmac_key: [u8; 32],
     pub deployment_epoch: u64,
+    pub rate_limiter: RateLimiter,
 }
 
 impl AppState {
@@ -20,6 +21,7 @@ impl AppState {
             database,
             token_hmac_key: config.token_hmac_key,
             deployment_epoch: config.deployment_epoch,
+            rate_limiter: RateLimiter::new(),
         })
     }
 

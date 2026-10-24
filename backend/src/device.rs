@@ -98,6 +98,12 @@ pub async fn get_recovery_wraps(
         return Err(AppError::InvalidSignature);
     }
 
+    state.rate_limiter.check_rate_limit(
+        &format!("recovery:{}", URL_SAFE_NO_PAD.encode(&principal.account_id)),
+        10,
+        std::time::Duration::from_secs(60),
+    )?;
+
     let status_row = sqlx::query("SELECT status FROM accounts WHERE account_id = $1")
         .bind(&principal.account_id)
         .fetch_optional(&state.database)
@@ -168,6 +174,12 @@ pub async fn register_device_recovery(
         return Err(AppError::InvalidSignature);
     }
 
+    state.rate_limiter.check_rate_limit(
+        &format!("recovery:{}", URL_SAFE_NO_PAD.encode(&principal.account_id)),
+        10,
+        std::time::Duration::from_secs(60),
+    )?;
+
     let device_id = Uuid::parse_str(&request.device_id).map_err(|_| AppError::MalformedRequest)?;
     if device_id.to_string() != request.device_id {
         return Err(AppError::MalformedRequest);
@@ -220,6 +232,16 @@ pub async fn register_device_recovery(
             .await?;
     if existing_device.is_some() {
         return Err(AppError::Conflict);
+    }
+
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devices WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&principal.account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_count >= 10 {
+        return Err(AppError::QuotaExceeded);
     }
 
     let active_key_version: i64 = account_row.try_get("active_key_version")?;

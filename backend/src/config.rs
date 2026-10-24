@@ -9,6 +9,7 @@ pub struct Config {
     pub database_max_connections: u32,
     pub token_hmac_key: [u8; 32],
     pub deployment_epoch: u64,
+    pub maintenance_interval_seconds: u64,
 }
 
 #[derive(Debug, Error)]
@@ -60,12 +61,18 @@ impl Config {
             .filter(|epoch| *epoch > 0)
             .ok_or(ConfigError::InvalidDeploymentEpoch)?;
 
+        let maintenance_interval_seconds = env::var("SYNC_MAINTENANCE_INTERVAL_SECONDS")
+            .unwrap_or_else(|_| "3600".to_owned())
+            .parse::<u64>()
+            .unwrap_or(3600);
+
         Ok(Self {
             bind_addr,
             database_url,
             database_max_connections,
             token_hmac_key,
             deployment_epoch,
+            maintenance_interval_seconds,
         })
     }
 }

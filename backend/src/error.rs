@@ -44,6 +44,10 @@ pub enum AppError {
     Conflict,
     #[error("not found")]
     NotFound,
+    #[error("rate limited")]
+    RateLimited { retry_after_s: u32 },
+    #[error("quota exceeded")]
+    QuotaExceeded,
     #[error("service unavailable")]
     Unavailable,
 }
@@ -172,6 +176,18 @@ impl IntoResponse for AppError {
                 "not_found",
                 "Resource not found.",
                 None,
+            ),
+            Self::RateLimited { retry_after_s } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "Too many requests.",
+                Some(retry_after_s),
+            ),
+            Self::QuotaExceeded => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "quota_exceeded",
+                "Account storage or device quota exceeded.",
+                Some(60),
             ),
             Self::Unavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,

@@ -83,6 +83,13 @@ pub async fn create_pairing_challenge(
     }
     require_protocol_v1(&headers)?;
     let target_account_id = decode_exact(&request.target_account_id, 32)?;
+
+    state.rate_limiter.check_rate_limit(
+        &format!("pairing:{}", URL_SAFE_NO_PAD.encode(&target_account_id)),
+        20,
+        std::time::Duration::from_secs(60),
+    )?;
+
     let device_id = parse_canonical_uuid(&request.device_id)?;
     let ed25519_pub = decode_exact(&request.device_ed25519_pub, 32)?;
     let x25519_pub = decode_exact(&request.device_x25519_pub, 32)?;
@@ -232,6 +239,16 @@ pub async fn approve_pairing(
     .await?;
     if device_exists {
         return Err(AppError::PairingChallengeInvalid);
+    }
+
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devices WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&approval.account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_count >= 10 {
+        return Err(AppError::QuotaExceeded);
     }
 
     let insert_device = sqlx::query(

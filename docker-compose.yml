@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: nexxpass-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nexxpass
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: nexxpass_sync
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexxpass -d nexxpass_sync"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  sync-server:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: nexxpass-sync-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://nexxpass:change-me@postgres:5432/nexxpass_sync"
+      SYNC_BIND_ADDR: "0.0.0.0:8080"
+      SYNC_DATABASE_MAX_CONNECTIONS: "10"
+      SYNC_TOKEN_KEY_HEX: "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+      SYNC_DEPLOYMENT_EPOCH: "1"
+      SYNC_MAINTENANCE_INTERVAL_SECONDS: "3600"
+      RUST_LOG: "info"
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres_data:

@@ -8,11 +8,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState::connect(&config).await?;
     state.migrate().await?;
 
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let maintenance_state = state.clone();
+    let maintenance_interval = std::time::Duration::from_secs(config.maintenance_interval_seconds);
+
+    let maintenance_handle = tokio::spawn(async move {
+        let mut interval_timer = tokio::time::interval(maintenance_interval);
+        interval_timer.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval_timer.tick() => {
+                    tracing::info!("running scheduled background maintenance");
+                    if let Err(e) = nexxpass_sync_server::maintenance::run_maintenance(&maintenance_state.database).await {
+                        tracing::error!(error = %e, "background maintenance execution failed");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("stopping background maintenance task");
+                    break;
+                }
+            }
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!(address = %config.bind_addr, "NexxPass Sync service started");
     axum::serve(listener, http::router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    let _ = shutdown_tx.send(true);
+    let _ = maintenance_handle.await;
+
     Ok(())
 }
 

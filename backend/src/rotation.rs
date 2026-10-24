@@ -771,6 +771,14 @@ pub async fn rewrite_rotation(
     let mut seq_counter: i64 = account_row.try_get("seq_counter")?;
     let initial_seq_counter = seq_counter;
 
+    let mut current_ciphertext_bytes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(octet_length(blob)), 0)::bigint \
+         FROM items WHERE account_id = $1 AND deleted = FALSE",
+    )
+    .bind(&account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
     let mut results = Vec::with_capacity(validated_mutations.len());
 
     for mutation in validated_mutations {
@@ -817,7 +825,8 @@ pub async fn rewrite_rotation(
         }
 
         let current_item = sqlx::query(
-            "SELECT version, seq, deleted FROM items WHERE account_id = $1 AND item_id = $2",
+            "SELECT version, seq, deleted, octet_length(blob) AS blob_len \
+             FROM items WHERE account_id = $1 AND item_id = $2",
         )
         .bind(&account_id)
         .bind(mutation.item_id)
@@ -830,6 +839,24 @@ pub async fn rewrite_rotation(
             ..
         } = mutation.op
         {
+            let old_blob_len: i64 = match &current_item {
+                Some(row) => {
+                    let is_del: bool = row.try_get("deleted")?;
+                    if is_del {
+                        0
+                    } else {
+                        row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64
+                    }
+                }
+                None => 0,
+            };
+            let new_blob_len = decoded_blob.len() as i64;
+            let net_diff = new_blob_len - old_blob_len;
+            if current_ciphertext_bytes + net_diff > 100 * 1024 * 1024 {
+                return Err(AppError::QuotaExceeded);
+            }
+            current_ciphertext_bytes += net_diff;
+
             let next_version = if let Some(item_row) = current_item {
                 let is_deleted: bool = item_row.try_get("deleted")?;
                 if is_deleted {
