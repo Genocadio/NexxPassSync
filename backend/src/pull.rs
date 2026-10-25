@@ -340,7 +340,7 @@ pub async fn handle_sync_pull(
             return Err(AppError::InvalidInput);
         }
 
-        let page_items = fetch_page_items(
+        let page = fetch_page_items(
             &mut tx,
             &account_id,
             token_data.next_cursor as i64,
@@ -350,21 +350,21 @@ pub async fn handle_sync_pull(
         )
         .await?;
 
-        let (done, page_cursor, next_cursor) = if page_items.len() < session_page_size as usize
-            || page_items
-                .last()
-                .map(|i| i.seq)
-                .unwrap_or(token_data.next_cursor)
-                >= token_data.high_watermark
-        {
-            (true, token_data.high_watermark, token_data.high_watermark)
+        // `done` reflects whether any change row remains in (cursor, H]. It must
+        // never be derived from the number of deduplicated items returned: a page
+        // can legitimately return fewer items than `page_size` when one item has
+        // several changes in the window or when tombstones are filtered out.
+        let done = !page.has_more;
+        // The continuation cursor is the raw scan boundary (last selected change
+        // row), not an item's latest-at-H sequence, which can jump past other
+        // items' change rows and silently skip them.
+        let page_cursor = if done {
+            token_data.high_watermark
         } else {
-            let last_seq = page_items
-                .last()
-                .map(|i| i.seq)
-                .unwrap_or(token_data.next_cursor);
-            (false, last_seq, last_seq)
+            page.boundary as u64
         };
+        let next_cursor = page.boundary as u64;
+        let page_items = page.items;
 
         sqlx::query(
             "UPDATE sync_sessions SET page_position = $2, current_cursor = $3, is_completed = $4 WHERE session_id = $1",
@@ -500,7 +500,7 @@ pub async fn handle_sync_pull(
     let session_id = Uuid::new_v4();
     let expiry_unix = now_unix + SESSION_TTL_SECONDS;
 
-    let page_items = fetch_page_items(
+    let page = fetch_page_items(
         &mut tx,
         &account_id,
         checkpoint as i64,
@@ -510,15 +510,16 @@ pub async fn handle_sync_pull(
     )
     .await?;
 
-    let (done, page_cursor, next_cursor) = if (checkpoint as i64) >= high_watermark
-        || page_items.len() < page_size as usize
-        || page_items.last().map(|i| i.seq).unwrap_or(checkpoint) >= high_watermark as u64
-    {
-        (true, high_watermark as u64, high_watermark as u64)
+    // Session completion is decided from remaining change rows, never from the
+    // deduplicated item count (see continuation branch above).
+    let done = !page.has_more;
+    let page_cursor = if done {
+        high_watermark as u64
     } else {
-        let last_seq = page_items.last().map(|i| i.seq).unwrap_or(checkpoint);
-        (false, last_seq, last_seq)
+        page.boundary as u64
     };
+    let next_cursor = page.boundary as u64;
+    let page_items = page.items;
 
     sqlx::query(
         "INSERT INTO sync_sessions ( \
@@ -717,6 +718,19 @@ pub async fn handle_sync_ack(
     }))
 }
 
+/// One page of pull results.
+///
+/// * `boundary` is the sequence of the last *raw* `item_changes` row consumed by
+///   this page. It is the only value that may be used as the next cursor.
+/// * `has_more` reports whether at least one change row remains in
+///   `(boundary, high_watermark]`, which is what decides session completion.
+#[derive(Debug)]
+struct PullPageScan {
+    items: Vec<ItemState>,
+    boundary: i64,
+    has_more: bool,
+}
+
 async fn fetch_page_items(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     account_id: &[u8],
@@ -724,37 +738,76 @@ async fn fetch_page_items(
     high_watermark: i64,
     limit: i64,
     is_full_snapshot: bool,
-) -> Result<Vec<ItemState>, AppError> {
+) -> Result<PullPageScan, AppError> {
     if cursor >= high_watermark {
-        return Ok(Vec::new());
+        return Ok(PullPageScan {
+            items: Vec::new(),
+            boundary: cursor,
+            has_more: false,
+        });
     }
 
+    // Scan the raw change log first. The row set is a contiguous prefix of
+    // (cursor, H], so consuming it never skips a row even when several changes
+    // belong to the same item.
+    let raw_rows = sqlx::query(
+        "SELECT seq, item_id FROM item_changes \
+         WHERE account_id = $1 AND seq > $2 AND seq <= $3 \
+         ORDER BY seq ASC LIMIT $4",
+    )
+    .bind(account_id)
+    .bind(cursor)
+    .bind(high_watermark)
+    .bind(limit + 1)
+    .fetch_all(&mut **tx)
+    .await?;
+
+    if raw_rows.is_empty() {
+        return Ok(PullPageScan {
+            items: Vec::new(),
+            boundary: cursor,
+            has_more: false,
+        });
+    }
+
+    let has_more = raw_rows.len() > limit as usize;
+    let consumed = &raw_rows[..(limit as usize).min(raw_rows.len())];
+    let boundary = match consumed.last() {
+        Some(row) => row.try_get::<i64, _>("seq")?,
+        None => {
+            return Ok(PullPageScan {
+                items: Vec::new(),
+                boundary: cursor,
+                has_more: false,
+            });
+        }
+    };
+
+    let mut item_ids: Vec<Uuid> = consumed
+        .iter()
+        .map(|row| row.try_get::<Uuid, _>("item_id"))
+        .collect::<Result<_, _>>()?;
+    item_ids.sort_unstable();
+    item_ids.dedup();
+
+    // For every item touched by the raw prefix, return its latest state at or
+    // before H (a mutable current row may already be past H).
     let rows = sqlx::query(
-        "WITH page_seqs AS ( \
-             SELECT seq, item_id \
-             FROM item_changes \
-             WHERE account_id = $1 AND seq > $2 AND seq <= $3 \
-             ORDER BY seq ASC \
-             LIMIT $4 \
-         ) \
-         SELECT c.item_id, c.version, c.seq, c.deleted, c.key_version, c.blob, \
+        "SELECT c.item_id, c.version, c.seq, c.deleted, c.key_version, c.blob, \
                 to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at \
-         FROM ( \
-             SELECT DISTINCT item_id FROM page_seqs \
-         ) items_in_page \
+         FROM unnest($2::uuid[]) AS p(item_id) \
          CROSS JOIN LATERAL ( \
              SELECT item_id, version, seq, deleted, key_version, blob, created_at \
              FROM item_changes \
-             WHERE account_id = $1 AND item_id = items_in_page.item_id AND seq <= $3 \
+             WHERE account_id = $1 AND item_id = p.item_id AND seq <= $3 \
              ORDER BY seq DESC \
              LIMIT 1 \
          ) c \
          ORDER BY c.seq ASC",
     )
     .bind(account_id)
-    .bind(cursor)
+    .bind(&item_ids)
     .bind(high_watermark)
-    .bind(limit)
     .fetch_all(&mut **tx)
     .await?;
 
@@ -762,7 +815,8 @@ async fn fetch_page_items(
     for row in rows {
         let deleted: bool = row.try_get("deleted")?;
         if is_full_snapshot && deleted {
-            // Full snapshots omit tombstones entirely.
+            // Full snapshots omit tombstones entirely. This filtering happens
+            // after the raw scan, so it can never end a session early.
             continue;
         }
 
@@ -793,5 +847,9 @@ async fn fetch_page_items(
         });
     }
 
-    Ok(items)
+    Ok(PullPageScan {
+        items,
+        boundary,
+        has_more,
+    })
 }
