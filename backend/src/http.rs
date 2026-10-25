@@ -48,6 +48,10 @@ pub fn router(state: AppState) -> Router {
             post(crate::pairing::approve_pairing),
         )
         .route("/sync/batch", post(crate::sync::handle_sync_batch))
+        .route(
+            "/sync/events",
+            axum::routing::get(crate::sync::handle_sync_events),
+        )
         .route("/sync/pull", post(crate::pull::handle_sync_pull))
         .route("/sync/ack", post(crate::pull::handle_sync_ack))
         .route("/rotation/start", post(crate::rotation::start_rotation))

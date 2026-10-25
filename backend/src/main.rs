@@ -20,8 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tokio::select! {
                 _ = interval_timer.tick() => {
                     tracing::info!("running scheduled background maintenance");
-                    if let Err(e) = nexxpass_sync_server::maintenance::run_maintenance(&maintenance_state.database).await {
-                        tracing::error!(error = %e, "background maintenance execution failed");
+                    match nexxpass_sync_server::maintenance::run_maintenance(&maintenance_state.database).await {
+                        Ok(Some(stats)) => tracing::info!(?stats, "background maintenance completed"),
+                        Ok(None) => tracing::debug!("maintenance skipped; advisory lock held by another instance"),
+                        Err(e) => tracing::error!(error = %e, "background maintenance execution failed"),
                     }
                 }
                 _ = shutdown_rx.changed() => {

@@ -1,10 +1,15 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, convert::Infallible};
 
-use axum::{extract::State, Extension, Json};
+use axum::{
+    extract::State,
+    response::sse::{Event, KeepAlive, Sse},
+    Extension, Json,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use uuid::Uuid;
 
 use crate::{
@@ -567,7 +572,47 @@ pub async fn handle_sync_batch(
 
     tx.commit().await?;
 
+    if seq_counter != initial_seq_counter {
+        let _ = state.sync_notifier.send(crate::state::SyncNotification {
+            account_id: account_id.clone(),
+            seq: seq_counter,
+        });
+    }
+
     Ok(Json(BatchResponse { results }))
+}
+
+/// GET /v1/sync/events
+/// Real-time Server-Sent Events (SSE) notification stream.
+/// Emits sequence updates `{"seq": N}` whenever changes are committed to the account.
+pub async fn handle_sync_events(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<
+    Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static>,
+    AppError,
+> {
+    if principal.kind != PrincipalKind::Device {
+        return Err(AppError::InvalidSignature);
+    }
+
+    let target_account_id = principal.account_id;
+    let rx = state.sync_notifier.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+        Ok(notification) if notification.account_id == target_account_id => {
+            let data = serde_json::json!({
+                "seq": notification.seq,
+            });
+            Some(Ok(Event::default().event("sync").data(data.to_string())))
+        }
+        _ => None,
+    });
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("ping"),
+    ))
 }
 
 pub(crate) fn parse_canonical_uuid(value: &str) -> Result<Uuid, AppError> {

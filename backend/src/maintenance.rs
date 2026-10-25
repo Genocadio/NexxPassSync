@@ -1,8 +1,33 @@
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub const MAINTENANCE_ADVISORY_LOCK_ID: i64 = 0x4e65_7878_5061_7373;
+
 /// Runs all periodic maintenance jobs across the database.
-pub async fn run_maintenance(pool: &PgPool) -> Result<MaintenanceStats, sqlx::Error> {
+/// Ensures single-runner execution across distributed instances via a Postgres advisory lock.
+pub async fn run_maintenance(pool: &PgPool) -> Result<Option<MaintenanceStats>, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(MAINTENANCE_ADVISORY_LOCK_ID)
+        .fetch_one(&mut *conn)
+        .await?;
+
+    if !lock_acquired {
+        tracing::info!("maintenance advisory lock held by another instance; skipping run");
+        return Ok(None);
+    }
+
+    let stats_res = execute_maintenance(pool).await;
+
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MAINTENANCE_ADVISORY_LOCK_ID)
+        .execute(&mut *conn)
+        .await;
+
+    stats_res.map(Some)
+}
+
+async fn execute_maintenance(pool: &PgPool) -> Result<MaintenanceStats, sqlx::Error> {
     Ok(MaintenanceStats {
         expired_cleaned: cleanup_expired_records(pool).await?,
         deadlines_enforced: enforce_rotation_deadlines(pool).await?,

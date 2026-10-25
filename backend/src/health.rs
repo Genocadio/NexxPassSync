@@ -4,8 +4,14 @@ use serde::Serialize;
 use crate::{error::AppError, state::AppState};
 
 #[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
+pub struct LiveResponse {
+    pub status: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct ReadyResponse {
+    pub status: &'static str,
+    pub database: &'static str,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -14,11 +20,14 @@ pub fn routes() -> Router<AppState> {
         .route("/ready", get(ready))
 }
 
-async fn live() -> Json<HealthResponse> {
-    Json(HealthResponse { status: "ok" })
+async fn live() -> Json<LiveResponse> {
+    Json(LiveResponse { status: "live" })
 }
 
-async fn ready(State(state): State<AppState>) -> Result<Json<HealthResponse>, AppError> {
+async fn ready(State(state): State<AppState>) -> Result<Json<ReadyResponse>, AppError> {
     sqlx::query("SELECT 1").execute(&state.database).await?;
-    Ok(Json(HealthResponse { status: "ready" }))
+    Ok(Json(ReadyResponse {
+        status: "ready",
+        database: "connected",
+    }))
 }

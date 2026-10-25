@@ -1477,18 +1477,185 @@ async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
 }
 
 #[tokio::test]
-async fn test_background_maintenance_jobs() {
+async fn test_background_maintenance_jobs_and_advisory_locking() {
     let (_router, state) = setup_test_app().await;
 
     let pool = &state.database;
 
-    // Run maintenance
+    // 1. Run maintenance normally -> acquires lock, returns Some(stats)
     let stats = nexxpass_sync_server::maintenance::run_maintenance(pool)
         .await
-        .expect("maintenance should run cleanly");
+        .expect("maintenance should run cleanly")
+        .expect("should acquire advisory lock");
+    assert_eq!(stats.expired_cleaned, 0);
 
-    // Verify stats structure returned
-    println!("Maintenance stats: {:?}", stats);
+    // 2. Simulate another instance holding the advisory lock
+    let mut conn = pool.acquire().await.unwrap();
+    let lock_acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(nexxpass_sync_server::maintenance::MAINTENANCE_ADVISORY_LOCK_ID)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        lock_acquired,
+        "test connection should acquire advisory lock"
+    );
+
+    // 3. Maintenance attempt while lock is held should return Ok(None)
+    let skipped = nexxpass_sync_server::maintenance::run_maintenance(pool)
+        .await
+        .expect("maintenance should run cleanly");
+    assert!(skipped.is_none(), "should skip execution when lock is held");
+
+    // 4. Release lock on test connection
+    let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(nexxpass_sync_server::maintenance::MAINTENANCE_ADVISORY_LOCK_ID)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+
+    // 5. Maintenance can now run again
+    let rerun = nexxpass_sync_server::maintenance::run_maintenance(pool)
+        .await
+        .expect("maintenance should run cleanly");
+    assert!(rerun.is_some(), "should run after lock is released");
+}
+
+#[tokio::test]
+async fn test_deep_healthchecks() {
+    let (router, _state) = setup_test_app().await;
+
+    // GET /health/live
+    let live_req = Request::builder()
+        .method("GET")
+        .uri("/health/live")
+        .body(Body::empty())
+        .unwrap();
+    let live_res = router.clone().oneshot(live_req).await.unwrap();
+    assert_eq!(live_res.status(), StatusCode::OK);
+    let live_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(live_res.into_body(), 1024).await.unwrap()).unwrap();
+    assert_eq!(live_json["status"].as_str().unwrap(), "live");
+
+    // GET /health/ready
+    let ready_req = Request::builder()
+        .method("GET")
+        .uri("/health/ready")
+        .body(Body::empty())
+        .unwrap();
+    let ready_res = router.clone().oneshot(ready_req).await.unwrap();
+    assert_eq!(ready_res.status(), StatusCode::OK);
+    let ready_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ready_res.into_body(), 1024).await.unwrap()).unwrap();
+    assert_eq!(ready_json["status"].as_str().unwrap(), "ready");
+    assert_eq!(ready_json["database"].as_str().unwrap(), "connected");
+}
+
+#[tokio::test]
+async fn test_realtime_sync_events_sse() {
+    use http_body_util::BodyExt;
+
+    let (router, _state) = setup_test_app().await;
+
+    let identity_key = make_signing_key(0x71);
+    let device_key = make_signing_key(0x72);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    let device_id = Uuid::new_v4();
+    let recovery_wrap = URL_SAFE_NO_PAD.encode([0x33; 105]);
+    let device_wrap = URL_SAFE_NO_PAD.encode([0x44; 105]);
+
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x55; 32]),
+        "derivation_version": 1,
+        "device": {
+            "device_id": device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x66; 32]),
+            "device_label": "Test SSE Device",
+            "wrap": device_wrap,
+        },
+        "recovery_wrap": recovery_wrap,
+    });
+
+    let reg_body_bytes = serde_json::to_vec(&reg_body).unwrap();
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &reg_body_bytes,
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // 1. Subscribe to SSE events endpoint
+    let sse_req = sign_request(
+        "GET",
+        "/v1/sync/events",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let sse_res = router.clone().oneshot(sse_req).await.unwrap();
+    assert_eq!(sse_res.status(), StatusCode::OK);
+    assert_eq!(
+        sse_res
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/event-stream"
+    );
+
+    // 2. Push a sync batch with 1 mutation
+    let blob_bytes = vec![0x42u8; 600];
+    let blob_b64u = URL_SAFE_NO_PAD.encode(&blob_bytes);
+    let batch_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let batch_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&batch_body).unwrap(),
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let batch_res = router.clone().oneshot(batch_req).await.unwrap();
+    assert_eq!(batch_res.status(), StatusCode::OK);
+
+    // 3. Read the emitted event from the SSE response stream
+    let mut body = sse_res.into_body();
+    let frame = body.frame().await.unwrap().unwrap();
+    let data_bytes = frame.into_data().unwrap();
+    let event_str = String::from_utf8(data_bytes.to_vec()).unwrap();
+    assert!(event_str.contains("event: sync"));
+    assert!(event_str.contains("\"seq\":1"));
 }
 
 #[tokio::test]
