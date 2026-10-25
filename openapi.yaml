@@ -1,0 +1,391 @@
+openapi: 3.1.0
+info:
+  title: NexxPass Zero-Knowledge Sync Protocol API
+  description: >
+    Production-grade zero-knowledge dumb sync engine API specification.
+    The server stores only authenticated, encrypted ciphertext blobs, key wraps,
+    and revision sequence counters, with zero access to plaintexts or master passwords.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:8080
+    description: Local Development / Docker Environment
+  - url: https://sync.nexxpass.com
+    description: Production Cluster
+
+components:
+  securitySchemes:
+    NPSSv1Auth:
+      type: apiKey
+      in: header
+      name: x-nexxpass-signature
+      description: >
+        Ed25519 signature over the canonical preimage:
+        `NPSSv1\n{METHOD}\n{PATH}\n{QUERY}\n{TIMESTAMP}\n{NONCE}\n{HEX(SHA256(BODY))}`
+        Accompanying headers:
+        - `x-nexxpass-protocol`: Must be "1"
+        - `x-nexxpass-account`: 32-byte account ID (base64url)
+        - `x-nexxpass-key`: "device" or "identity"
+        - `x-nexxpass-device`: Device UUIDv4 (if key=device)
+        - `x-nexxpass-timestamp`: Unix timestamp in seconds (within ±300s window)
+        - `x-nexxpass-nonce`: Unique 16-byte nonce (base64url)
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+            - request_id
+          properties:
+            code:
+              type: string
+              example: unsupported_key_version
+            message:
+              type: string
+              example: Key version is not supported for this account state.
+            request_id:
+              type: string
+              format: uuid
+            retry_after_s:
+              type: integer
+              description: Present on rate limit (429) or service unavailable (503).
+
+    AccountRegistrationRequest:
+      type: object
+      required:
+        - account_id
+        - identity_ed25519_pub
+        - identity_x25519_pub
+        - derivation_version
+        - recovery_wrap
+        - device
+      properties:
+        account_id:
+          type: string
+          description: 32-byte account ID (base64url)
+        identity_ed25519_pub:
+          type: string
+          description: 32-byte Ed25519 public key (base64url)
+        identity_x25519_pub:
+          type: string
+          description: 32-byte X25519 public key (base64url)
+        derivation_version:
+          type: integer
+          example: 1
+        recovery_wrap:
+          type: string
+          description: 105-byte emergency recovery wrap (base64url)
+        device:
+          $ref: '#/components/schemas/InitialDeviceRegistration'
+
+    InitialDeviceRegistration:
+      type: object
+      required:
+        - device_id
+        - device_ed25519_pub
+        - device_x25519_pub
+        - device_label
+        - wrap
+      properties:
+        device_id:
+          type: string
+          format: uuid
+        device_ed25519_pub:
+          type: string
+          description: 32-byte Ed25519 public key (base64url)
+        device_x25519_pub:
+          type: string
+          description: 32-byte X25519 public key (base64url)
+        device_label:
+          type: string
+          maxLength: 100
+          example: MacBook Pro
+        wrap:
+          type: string
+          description: 105-byte initial master key wrap (base64url)
+
+    MutationRequest:
+      type: object
+      required:
+        - op
+        - operation_id
+        - item_id
+        - base_version
+      properties:
+        op:
+          type: string
+          enum: [put, delete]
+        operation_id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+        base_version:
+          type: integer
+          minimum: 0
+        key_version:
+          type: integer
+          minimum: 1
+          description: Required when op=put.
+        blob:
+          type: string
+          description: Base64url-encoded ciphertext blob (552 to 65,536 bytes). Required when op=put.
+
+    OperationResult:
+      type: object
+      required:
+        - operation_id
+        - status
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [applied, duplicate, conflict, item_gone, item_deleted, unsupported_key_version]
+        version:
+          type: integer
+          nullable: true
+        seq:
+          type: integer
+          nullable: true
+
+    SyncEventNotification:
+      type: object
+      required:
+        - seq
+      properties:
+        seq:
+          type: integer
+          description: Monotonic sequence revision number of the committed account change.
+
+paths:
+  /health/live:
+    get:
+      summary: Liveness Probe
+      description: Returns 200 OK immediately without database query.
+      responses:
+        '200':
+          description: Service process is running.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: live
+
+  /health/ready:
+    get:
+      summary: Readiness Probe
+      description: Performs a database pool ping (SELECT 1). Returns 503 if unavailable.
+      responses:
+        '200':
+          description: Database connected and responsive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  database:
+                    type: string
+                    example: connected
+        '503':
+          description: Database connection failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /v1/accounts:
+    post:
+      summary: Register Account
+      description: Enrolls a new user account with initial device and recovery wrap.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountRegistrationRequest'
+      responses:
+        '201':
+          description: Account enrolled.
+        '400':
+          $ref: '#/components/responses/Error'
+        '409':
+          description: Account ID retired or already registered.
+
+  /v1/accounts/me:
+    get:
+      summary: Get Account State
+      description: Returns active key version, keyring version, rotation state, device info, and key wraps.
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Account metadata and key wraps.
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+
+  /v1/devices:
+    get:
+      summary: List Devices
+      description: Returns all enrolled devices with active status, last_seen_at, first_sync_at, and acked key versions.
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Device list.
+
+  /v1/pairings:
+    post:
+      summary: Create Device Pairing Challenge
+      description: Initiates a 5-minute QR pairing challenge for a new device.
+      responses:
+        '202':
+          description: Pairing challenge created.
+
+  /v1/pairings/{pairing_id}/approve:
+    post:
+      summary: Approve Pairing Challenge
+      description: Enrolled device approves a pairing challenge and delivers a key wrap encrypted for the new device.
+      security:
+        - NPSSv1Auth: []
+      parameters:
+        - name: pairing_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: New device enrolled successfully.
+
+  /v1/sync/batch:
+    post:
+      summary: Atomic Sync Batch Mutation
+      description: Pushes an atomic batch of up to 100 item mutations (put/delete) with idempotency deduplication.
+      security:
+        - NPSSv1Auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - operations
+              properties:
+                operations:
+                  type: array
+                  maxItems: 100
+                  items:
+                    $ref: '#/components/schemas/MutationRequest'
+      responses:
+        '200':
+          description: Batch mutation processed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - results
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OperationResult'
+
+  /v1/sync/pull:
+    post:
+      summary: Multi-Page Sync Pull
+      description: Fetches live vault items and tombstones using cursors, session management, and continuation tokens.
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Items page with continuation token and cryptographic page receipt.
+
+  /v1/sync/ack:
+    post:
+      summary: Acknowledge Sync Page Receipt
+      description: Confirms page delivery and advances the device's last_seen_seq checkpoint.
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Page receipt acknowledged.
+
+  /v1/sync/events:
+    get:
+      summary: Real-Time SSE Change Notifications
+      description: >
+        Zero-knowledge Server-Sent Events stream. Emits `event: sync\ndata: {"seq": N}`
+        whenever new mutations are committed for the account. Contains no ciphertext or item metadata.
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Event stream established.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  /v1/rotation/start:
+    post:
+      summary: Start Key Rotation / Master Password Change
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Rotation started.
+
+  /v1/rotation/rewrite:
+    post:
+      summary: Re-encrypt Live Items
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Items re-encrypted.
+
+  /v1/rotation/complete:
+    post:
+      summary: Complete Rotation (Option A Non-Blocking)
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Target key activated, old wraps purged, writes unfrozen immediately.
+
+  /v1/rotation/ack:
+    post:
+      summary: Acknowledge Master Password Update
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Device acknowledged new active key version.
+
+responses:
+  Error:
+    description: Standard error response envelope.
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/ErrorResponse'
