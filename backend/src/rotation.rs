@@ -347,7 +347,7 @@ pub async fn ack_rotation(
     let mut tx = state.database.begin().await?;
 
     let account_row = sqlx::query(
-        "SELECT rotation_mode, rotation_target_key_version \
+        "SELECT rotation_mode, rotation_target_key_version, active_key_version \
          FROM accounts WHERE account_id = $1 FOR UPDATE",
     )
     .bind(&principal.account_id)
@@ -359,17 +359,24 @@ pub async fn ack_rotation(
     };
 
     let rotation_mode: String = account_row.try_get("rotation_mode")?;
-    if rotation_mode == "idle" {
-        return Err(AppError::Conflict);
-    }
-
+    let active_key_version: i64 = account_row.try_get("active_key_version")?;
     let target_key_version: Option<i64> = account_row.try_get("rotation_target_key_version")?;
-    if target_key_version != Some(request.key_version) {
+
+    let is_valid_version = if rotation_mode == "idle" {
+        request.key_version == active_key_version
+    } else {
+        target_key_version == Some(request.key_version)
+    };
+
+    if !is_valid_version {
         return Err(AppError::Conflict);
     }
 
-    let is_mpc = rotation_mode == "master_password_change";
-    if is_mpc && request.local_master_password_updated != Some(true) {
+    let is_mpc = rotation_mode == "master_password_change"
+        || request.local_master_password_updated == Some(true);
+    if rotation_mode == "master_password_change"
+        && request.local_master_password_updated != Some(true)
+    {
         return Err(AppError::InvalidInput);
     }
 
@@ -452,6 +459,7 @@ pub async fn complete_rotation(
     }
 
     // Acknowledgement checks.
+    // In compromise mode, all active devices must acknowledge target before completion.
     if rotation_mode == "compromise" {
         let unacked_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM rotation_participants \
@@ -465,21 +473,30 @@ pub async fn complete_rotation(
         if unacked_count > 0 {
             return Err(AppError::Conflict);
         }
-    } else if rotation_mode == "master_password_change" {
-        let unacked_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM rotation_participants \
-             WHERE account_id = $1 AND key_version = $2 AND revoked_at IS NULL \
-               AND (key_acknowledged_at IS NULL OR local_master_password_updated_at IS NULL)",
-        )
-        .bind(&principal.account_id)
-        .bind(target_key_version)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        if unacked_count > 0 {
-            return Err(AppError::Conflict);
-        }
     }
+
+    // Acknowledge caller device for the target key version.
+    sqlx::query(
+        "UPDATE devices SET acked_key_version = GREATEST(COALESCE(acked_key_version, 0), $2) \
+         WHERE account_id = $1 AND device_id = $3",
+    )
+    .bind(&principal.account_id)
+    .bind(target_key_version)
+    .bind(caller_device_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE rotation_participants SET \
+             key_acknowledged_at = COALESCE(key_acknowledged_at, now()), \
+             local_master_password_updated_at = COALESCE(local_master_password_updated_at, now()) \
+         WHERE account_id = $1 AND key_version = $2 AND device_id = $3",
+    )
+    .bind(&principal.account_id)
+    .bind(target_key_version)
+    .bind(caller_device_id)
+    .execute(&mut *tx)
+    .await?;
 
     // Activate pending wraps, delete old wraps.
     sqlx::query("DELETE FROM key_wraps WHERE account_id = $1 AND key_version < $2")

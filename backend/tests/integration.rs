@@ -1328,53 +1328,7 @@ async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
         "applied"
     );
 
-    // 9. Attempt complete before acks (fails with conflict)
-    let premature_comp_req = sign_request(
-        "POST",
-        "/v1/rotation/complete",
-        &[],
-        &device_1_key,
-        &account_id,
-        Some(device_1_id),
-        false,
-    );
-    let premature_comp_res = router.clone().oneshot(premature_comp_req).await.unwrap();
-    assert_eq!(premature_comp_res.status(), StatusCode::CONFLICT);
-
-    // 10. Acks from both devices
-    let ack_1_body = serde_json::json!({
-        "key_version": 3,
-        "local_master_password_updated": true,
-    });
-    let ack_1_req = sign_request(
-        "POST",
-        "/v1/rotation/ack",
-        &serde_json::to_vec(&ack_1_body).unwrap(),
-        &device_1_key,
-        &account_id,
-        Some(device_1_id),
-        false,
-    );
-    let ack_1_res = router.clone().oneshot(ack_1_req).await.unwrap();
-    assert_eq!(ack_1_res.status(), StatusCode::OK);
-
-    let ack_2_body = serde_json::json!({
-        "key_version": 3,
-        "local_master_password_updated": true,
-    });
-    let ack_2_req = sign_request(
-        "POST",
-        "/v1/rotation/ack",
-        &serde_json::to_vec(&ack_2_body).unwrap(),
-        &device_2_key,
-        &account_id,
-        Some(device_2_id),
-        false,
-    );
-    let ack_2_res = router.clone().oneshot(ack_2_req).await.unwrap();
-    assert_eq!(ack_2_res.status(), StatusCode::OK);
-
-    // 11. Complete rotation
+    // 9. Option A: Complete rotation immediately on Device 1 without waiting for Device 2 ack
     let comp_req = sign_request(
         "POST",
         "/v1/rotation/complete",
@@ -1393,7 +1347,7 @@ async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
     assert_eq!(comp_json["active_key_version"].as_i64().unwrap(), 3);
     assert!(!comp_json["writes_frozen"].as_bool().unwrap());
 
-    // 12. Normal writes are now unfrozen under active key version 3
+    // 10. Device 1 can write immediately under active key version 3
     let unfrozen_item_uuid = Uuid::new_v4();
     let unfrozen_body = serde_json::json!({
         "operations": [
@@ -1418,6 +1372,108 @@ async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
     );
     let unfrozen_res = router.clone().oneshot(unfrozen_req).await.unwrap();
     assert_eq!(unfrozen_res.status(), StatusCode::OK);
+    let unfrozen_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(unfrozen_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        unfrozen_json["results"][0]["status"].as_str().unwrap(),
+        "applied"
+    );
+
+    // 11. Offline Device 2 attempts write with old key_version (1) -> rejected with unsupported_key_version
+    let stale_write_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let stale_write_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&stale_write_body).unwrap(),
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let stale_write_res = router.clone().oneshot(stale_write_req).await.unwrap();
+    assert_eq!(stale_write_res.status(), StatusCode::OK);
+    let stale_write_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(stale_write_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        stale_write_json["results"][0]["status"].as_str().unwrap(),
+        "unsupported_key_version"
+    );
+
+    // 12. Device 2 wakes up, enters new password, and acknowledges key_version 3 in idle mode
+    let ack_2_body = serde_json::json!({
+        "key_version": 3,
+        "local_master_password_updated": true,
+    });
+    let ack_2_req = sign_request(
+        "POST",
+        "/v1/rotation/ack",
+        &serde_json::to_vec(&ack_2_body).unwrap(),
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let ack_2_res = router.clone().oneshot(ack_2_req).await.unwrap();
+    assert_eq!(ack_2_res.status(), StatusCode::OK);
+    let ack_2_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(ack_2_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(ack_2_json["active_key_version"].as_i64().unwrap(), 3);
+    assert_eq!(ack_2_json["mode"].as_str().unwrap(), "idle");
+
+    // 13. Device 2 can now write with key_version 3
+    let dev2_write_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 3,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let dev2_write_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&dev2_write_body).unwrap(),
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let dev2_write_res = router.clone().oneshot(dev2_write_req).await.unwrap();
+    assert_eq!(dev2_write_res.status(), StatusCode::OK);
+    let dev2_write_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(dev2_write_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        dev2_write_json["results"][0]["status"].as_str().unwrap(),
+        "applied"
+    );
 }
 
 #[tokio::test]
