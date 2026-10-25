@@ -55,6 +55,8 @@ pub struct DevicePublic {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_sync_at: Option<String>,
     pub last_seen_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acked_key_version: Option<i64>,
@@ -362,6 +364,7 @@ pub async fn list_devices(
         "SELECT device_id, device_label, device_ed25519_pub, device_x25519_pub, \
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at, \
                 to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_seen_at, \
+                to_char(first_sync_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS first_sync_at, \
                 last_seen_seq, acked_key_version, \
                 to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS revoked_at \
          FROM devices WHERE account_id = $1 ORDER BY created_at ASC",
@@ -382,6 +385,7 @@ pub async fn list_devices(
             device_x25519_pub: URL_SAFE_NO_PAD.encode(x_pub),
             created_at: row.try_get("created_at")?,
             last_seen_at: row.try_get("last_seen_at")?,
+            first_sync_at: row.try_get("first_sync_at")?,
             last_seen_seq: row.try_get("last_seen_seq")?,
             acked_key_version: row.try_get("acked_key_version")?,
             revoked_at: row.try_get("revoked_at")?,

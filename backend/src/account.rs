@@ -34,6 +34,8 @@ struct DeviceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     first_sync_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     acked_key_version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     revoked_at: Option<String>,
@@ -99,6 +101,7 @@ pub async fn get_account_me(
                 a.tombstone_floor_seq, a.change_floor_seq, d.last_seen_seq, \
                 d.acked_key_version, \
                 to_char(d.first_sync_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS first_sync_at, \
+                to_char(d.last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_seen_at, \
                 to_char(d.revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS revoked_at \
          FROM accounts a JOIN devices d ON d.account_id = a.account_id \
          WHERE a.account_id = $1 AND d.device_id = $2",
@@ -120,11 +123,21 @@ pub async fn get_account_me(
     let tombstone_floor_seq: i64 = row.try_get("tombstone_floor_seq")?;
     let change_floor_seq: i64 = row.try_get("change_floor_seq")?;
     let first_sync_at: Option<String> = row.try_get("first_sync_at")?;
+    let last_seen_at: Option<String> = row.try_get("last_seen_at")?;
     let acked_key_version: Option<i64> = row.try_get("acked_key_version")?;
     let revoked_at: Option<String> = row.try_get("revoked_at")?;
     if revoked_at.is_some() {
         return Err(AppError::DeviceRevoked);
     }
+
+    // Touch device activity timestamp
+    let _ = sqlx::query(
+        "UPDATE devices SET last_seen_at = now() WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(&principal.account_id)
+    .bind(device_id)
+    .execute(&state.database)
+    .await;
 
     let rotation = rotation_info(&state.database, &principal.account_id).await?;
 
@@ -183,6 +196,7 @@ pub async fn get_account_me(
             device_id: device_id.to_string(),
             last_seen_seq,
             first_sync_at,
+            last_seen_at,
             acked_key_version,
             revoked_at,
         },

@@ -301,6 +301,14 @@ pub async fn handle_sync_pull(
             return Err(AppError::DeviceRevoked);
         }
 
+        sqlx::query(
+            "UPDATE devices SET last_seen_at = now() WHERE account_id = $1 AND device_id = $2",
+        )
+        .bind(&account_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+
         let session_row = sqlx::query(
             "SELECT deployment_epoch, high_watermark, page_size, page_position, is_full_snapshot, is_completed, is_abandoned, expires_at \
              FROM sync_sessions \
@@ -438,6 +446,12 @@ pub async fn handle_sync_pull(
         return Err(AppError::DeviceRevoked);
     }
     let last_seen_seq: i64 = device_row.try_get("last_seen_seq")?;
+
+    sqlx::query("UPDATE devices SET last_seen_at = now() WHERE account_id = $1 AND device_id = $2")
+        .bind(&account_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
 
     // Plain committed read of accounts (lock-free capture of high watermark H).
     let account_row = sqlx::query(
@@ -659,6 +673,12 @@ pub async fn handle_sync_ack(
     .bind(&request.page_receipt)
     .execute(&mut *tx)
     .await?;
+
+    sqlx::query("UPDATE devices SET last_seen_at = now() WHERE account_id = $1 AND device_id = $2")
+        .bind(&account_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
 
     if !is_full_snapshot {
         if (request.terminal_seq as i64) > last_seen_seq {

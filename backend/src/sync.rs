@@ -241,6 +241,16 @@ pub async fn handle_sync_batch(
         return Err(AppError::DeviceRevoked);
     }
 
+    // Touch device activity timestamp and set first_sync_at if this is the first batch
+    sqlx::query(
+        "UPDATE devices SET last_seen_at = now(), first_sync_at = COALESCE(first_sync_at, now()) \
+         WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(&account_id)
+    .bind(device_id)
+    .execute(&mut *tx)
+    .await?;
+
     let rotation_mode: String = account_row.try_get("rotation_mode")?;
     if rotation_mode == "master_password_change" {
         return Err(AppError::RotationInProgress);
@@ -595,6 +605,16 @@ pub async fn handle_sync_events(
     if principal.kind != PrincipalKind::Device {
         return Err(AppError::InvalidSignature);
     }
+    let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
+
+    // Touch device activity timestamp
+    let _ = sqlx::query(
+        "UPDATE devices SET last_seen_at = now() WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(&principal.account_id)
+    .bind(caller_device_id)
+    .execute(&state.database)
+    .await;
 
     let target_account_id = principal.account_id;
     let rx = state.sync_notifier.subscribe();

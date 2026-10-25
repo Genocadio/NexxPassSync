@@ -1841,3 +1841,123 @@ async fn test_defensive_security_and_cache_control_headers() {
         .unwrap()
         .contains("max-age=63072000"));
 }
+
+#[tokio::test]
+async fn test_device_live_last_seen_at_tracking() {
+    let (router, _state) = setup_test_app().await;
+
+    let identity_key = make_signing_key(0x81);
+    let device_key = make_signing_key(0x82);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    let device_id = Uuid::new_v4();
+    let recovery_wrap = URL_SAFE_NO_PAD.encode([0x33; 105]);
+    let device_wrap = URL_SAFE_NO_PAD.encode([0x44; 105]);
+
+    // 1. Register account with device
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x55; 32]),
+        "derivation_version": 1,
+        "device": {
+            "device_id": device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x66; 32]),
+            "device_label": "Tracking Test Device",
+            "wrap": device_wrap,
+        },
+        "recovery_wrap": recovery_wrap,
+    });
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // 2. Fetch device list -> get initial last_seen_at
+    let list_req = sign_request(
+        "GET",
+        "/v1/devices",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let list_res = router.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_res.status(), StatusCode::OK);
+    let list_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let initial_last_seen = list_json["devices"][0]["last_seen_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!initial_last_seen.is_empty());
+
+    // 3. Sleep briefly and push a sync batch
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let blob_bytes = vec![0x42u8; 600];
+    let blob_b64u = URL_SAFE_NO_PAD.encode(&blob_bytes);
+    let batch_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let batch_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&batch_body).unwrap(),
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let batch_res = router.clone().oneshot(batch_req).await.unwrap();
+    assert_eq!(batch_res.status(), StatusCode::OK);
+
+    // 4. Verify last_seen_at has updated and first_sync_at is now populated
+    let list_req2 = sign_request(
+        "GET",
+        "/v1/devices",
+        &[],
+        &device_key,
+        &account_id,
+        Some(device_id),
+        false,
+    );
+    let list_res2 = router.clone().oneshot(list_req2).await.unwrap();
+    let list_json2: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list_res2.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let updated_last_seen = list_json2["devices"][0]["last_seen_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_sync_at = list_json2["devices"][0]["first_sync_at"].as_str().unwrap();
+
+    assert_ne!(initial_last_seen, updated_last_seen);
+    assert!(!first_sync_at.is_empty());
+}
