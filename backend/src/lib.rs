@@ -10,6 +10,7 @@ pub mod pairing;
 pub mod pull;
 pub mod rate_limit;
 pub mod registration;
+pub mod replay;
 pub mod rotation;
 pub mod state;
 pub mod sync;

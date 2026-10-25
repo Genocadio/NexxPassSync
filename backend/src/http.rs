@@ -1,6 +1,9 @@
 use axum::{
     body::Body,
-    http::{Request, StatusCode},
+    http::{
+        header::{HeaderName, HeaderValue},
+        Request, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
@@ -85,7 +88,34 @@ pub fn router(state: AppState) -> Router {
         // metadata-only; signed bytes and secrets must never be emitted.
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(map_payload_limit_error))
+        .layer(middleware::from_fn(set_security_headers))
         .with_state(state)
+}
+
+async fn set_security_headers(request: Request<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-frame-options"),
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    headers.insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(
+        HeaderName::from_static("pragma"),
+        HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 async fn map_payload_limit_error(request: Request<Body>, next: Next) -> Response {

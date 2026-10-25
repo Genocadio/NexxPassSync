@@ -1804,3 +1804,40 @@ async fn test_active_device_quota() {
         "quota_exceeded"
     );
 }
+
+#[tokio::test]
+async fn test_defensive_security_and_cache_control_headers() {
+    let (router, _state) = setup_test_app().await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health/live")
+        .body(Body::empty())
+        .unwrap();
+    let res = router.oneshot(req).await.unwrap();
+
+    let headers = res.headers();
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        headers.get("x-frame-options").unwrap().to_str().unwrap(),
+        "DENY"
+    );
+    assert_eq!(
+        headers.get("cache-control").unwrap().to_str().unwrap(),
+        "no-store, no-cache, must-revalidate"
+    );
+    assert_eq!(headers.get("pragma").unwrap().to_str().unwrap(), "no-cache");
+    assert!(headers
+        .get("strict-transport-security")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("max-age=63072000"));
+}

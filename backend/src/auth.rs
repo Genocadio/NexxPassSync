@@ -217,12 +217,18 @@ pub async fn consume_nonce(
     principal_id: &[u8],
     nonce: &[u8],
 ) -> Result<(), AppError> {
-    if nonce.len() != 16 {
-        return Err(AppError::MalformedRequest);
+    let nonce_arr: [u8; 16] = nonce.try_into().map_err(|_| AppError::MalformedRequest)?;
+
+    // 1. Fast in-memory check: rejects duplicate nonces in O(1) without DB overhead
+    if !state
+        .replay_filter
+        .check_and_insert(principal_id, &nonce_arr)
+    {
+        return Err(AppError::ReplayDetected);
     }
-    sqlx::query("DELETE FROM request_nonces WHERE expires_at <= now()")
-        .execute(&state.database)
-        .await?;
+
+    // 2. Durable persistence across instances/restarts
+    // (Note: expired nonces are cleaned periodically by background maintenance)
     let inserted = sqlx::query(
         "INSERT INTO request_nonces (principal_id, nonce, expires_at) \
          VALUES ($1, $2, now() + ($3 * interval '1 hour')) ON CONFLICT DO NOTHING",
