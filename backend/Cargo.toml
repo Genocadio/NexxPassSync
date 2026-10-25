@@ -21,6 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 unicode-normalization = "0.1"
 hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"
