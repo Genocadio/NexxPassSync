@@ -1,0 +1,108 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Cancel superseded runs on rapid pushes to the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write # Required for purging previous workflow caches via GitHub CLI
+
+jobs:
+  check:
+    name: Lint, Test & Validate
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: nexxpass
+          POSTGRES_PASSWORD: change-me
+          POSTGRES_DB: nexxpass_sync
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Format check
+        run: cargo fmt --manifest-path backend/Cargo.toml -- --check
+
+      - name: Clippy linter
+        run: cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
+
+      - name: Run test suite (unit, integration, vectors)
+        run: cargo test --manifest-path backend/Cargo.toml --all-targets
+        env:
+          DATABASE_URL: postgres://nexxpass:change-me@localhost:5432/nexxpass_sync
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: check
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Purge old Docker build cache
+        run: |
+          echo "Purging old GitHub Actions cache entries to prevent stale layer bloat..."
+          gh cache list --limit 100 --json id -q '.[].id' 2>/dev/null | while read -r id; do
+            if [ -n "$id" ]; then
+              echo "Deleting cache ID: $id"
+              gh cache delete "$id" || true
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/nexxpass-sync-server:latest
+            ${{ secrets.DOCKER_USERNAME }}/nexxpass-sync-server:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

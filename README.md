@@ -1,6 +1,6 @@
 # NexxPassSync
 
-[![CI](https://github.com/Genocadio/NexxPassSync/actions/workflows/ci.yml/badge.svg)](https://github.com/Genocadio/NexxPassSync/actions/workflows/ci.yml)
+[![Build & Push](https://github.com/Genocadio/NexxPassSync/actions/workflows/build-and-push.yml/badge.svg)](https://github.com/Genocadio/NexxPassSync/actions/workflows/build-and-push.yml)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![PostgreSQL](https://img.shields.io/badge/postgresql-17-blue.svg)](https://www.postgresql.org/)
 [![License](https://img.shields.io/badge/license-Proprietary-red.svg)]()
