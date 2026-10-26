@@ -59,6 +59,25 @@ pub struct DeviceRegistrationResponse {
     pub target_key_version: Option<i64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelaySubmitRequest {
+    pub device_id: String,
+    pub encrypted_payload: String,
+}
+
+#[derive(Serialize)]
+pub struct RelaySubmitResponse {
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct RelayStatusResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_payload: Option<String>,
+}
+
 struct ValidatedApproval {
     pairing_id: Uuid,
     account_id: Vec<u8>,
@@ -337,6 +356,65 @@ pub async fn approve_pairing(
         active_key_version,
         target_key_version,
     }))
+}
+
+pub async fn submit_pairing_relay(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(request): Json<RelaySubmitRequest>,
+) -> Result<Json<RelaySubmitResponse>, AppError> {
+    let device_id = parse_canonical_uuid(&request.device_id)?;
+    if request.encrypted_payload.is_empty() || request.encrypted_payload.len() > 8192 {
+        return Err(AppError::InvalidInput);
+    }
+
+    sqlx::query(
+        "INSERT INTO pairing_relays (device_id, account_id, encrypted_payload, created_at, expires_at) \
+         VALUES ($1, $2, $3, now(), now() + interval '10 minutes') \
+         ON CONFLICT (device_id) DO UPDATE SET \
+             account_id = EXCLUDED.account_id, \
+             encrypted_payload = EXCLUDED.encrypted_payload, \
+             created_at = now(), \
+             expires_at = now() + interval '10 minutes'",
+    )
+    .bind(device_id)
+    .bind(&principal.account_id)
+    .bind(&request.encrypted_payload)
+    .execute(&state.database)
+    .await?;
+
+    Ok(Json(RelaySubmitResponse {
+        status: "stored".to_string(),
+    }))
+}
+
+pub async fn get_pairing_relay(
+    State(state): State<AppState>,
+    Path(device_id_str): Path<String>,
+) -> Result<Json<RelayStatusResponse>, AppError> {
+    let device_id = parse_canonical_uuid(&device_id_str)?;
+
+    let row = sqlx::query(
+        "SELECT encrypted_payload FROM pairing_relays \
+         WHERE device_id = $1 AND expires_at > now()",
+    )
+    .bind(device_id)
+    .fetch_optional(&state.database)
+    .await?;
+
+    match row {
+        Some(r) => {
+            let payload: String = r.try_get("encrypted_payload")?;
+            Ok(Json(RelayStatusResponse {
+                status: "ready".to_string(),
+                encrypted_payload: Some(payload),
+            }))
+        }
+        None => Ok(Json(RelayStatusResponse {
+            status: "pending".to_string(),
+            encrypted_payload: None,
+        })),
+    }
 }
 
 async fn insert_wrap(

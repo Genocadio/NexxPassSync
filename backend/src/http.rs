@@ -50,6 +50,10 @@ pub fn router(state: AppState) -> Router {
             "/pairings/{pairing_id}/approve",
             post(crate::pairing::approve_pairing),
         )
+        .route(
+            "/pairings/relay",
+            post(crate::pairing::submit_pairing_relay),
+        )
         .route("/sync/batch", post(crate::sync::handle_sync_batch))
         .route(
             "/sync/events",
@@ -77,6 +81,10 @@ pub fn router(state: AppState) -> Router {
     let api_v1 = Router::new()
         .route("/accounts", post(crate::registration::register_account))
         .route("/pairings", post(crate::pairing::create_pairing_challenge))
+        .route(
+            "/pairings/relay/{device_id}",
+            axum::routing::get(crate::pairing::get_pairing_relay),
+        )
         .merge(authenticated_routes);
     Router::new()
         .nest("/health", health::routes())
