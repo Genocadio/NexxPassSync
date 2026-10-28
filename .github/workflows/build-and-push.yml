@@ -25,7 +25,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:16-alpine
         env:
           POSTGRES_USER: nexxpass
           POSTGRES_PASSWORD: change-me
