@@ -1,0 +1,99 @@
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: nexxpass-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3 QUIC support
+    environment:
+      SYNC_DOMAIN: "${SYNC_DOMAIN:-pass.nexxserve.dev}"
+      ACME_EMAIL: "${ACME_EMAIL:-admin@nexxserve.dev}"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    depends_on:
+      sync-server:
+        condition: service_healthy
+    networks:
+      - sync_network
+
+  sync-server:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    container_name: nexxpass-sync-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-nexxpass}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nexxpass_sync}"
+      SYNC_BIND_ADDR: "0.0.0.0:8080"
+      SYNC_DATABASE_MAX_CONNECTIONS: "${SYNC_DATABASE_MAX_CONNECTIONS:-25}"
+      SYNC_TOKEN_KEY_HEX: "${SYNC_TOKEN_KEY_HEX}"
+      SYNC_DEPLOYMENT_EPOCH: "${SYNC_DEPLOYMENT_EPOCH:-1}"
+      SYNC_MAINTENANCE_INTERVAL_SECONDS: "${SYNC_MAINTENANCE_INTERVAL_SECONDS:-3600}"
+      RUST_LOG: "info,nexxpass_sync_server=debug"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - sync_network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexxpass-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-nexxpass}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-nexxpass_sync}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexxpass} -d ${POSTGRES_DB:-nexxpass_sync}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sync_network
+
+  db-backup:
+    build:
+      context: ./backups
+      dockerfile: Dockerfile
+    container_name: nexxpass-db-backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: "${POSTGRES_USER:-nexxpass}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:-nexxpass_sync}"
+      RETENTION_DAYS: "${BACKUP_RETENTION_DAYS:-14}"
+      S3_BUCKET: "${BACKUP_S3_BUCKET:-}"
+    volumes:
+      - backups_data:/backups
+    networks:
+      - sync_network
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+  caddy_logs:
+  backups_data:
+
+networks:
+  sync_network:
+    driver: bridge

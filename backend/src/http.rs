@@ -88,6 +88,8 @@ pub fn router(state: AppState) -> Router {
         .merge(authenticated_routes);
     Router::new()
         .nest("/health", health::routes())
+        .route("/health", axum::routing::get(health::deep_health))
+        .route("/metrics", axum::routing::get(health::metrics))
         .nest("/v1", api_v1)
         .fallback(|| async { StatusCode::NOT_FOUND })
         .layer(RequestBodyLimitLayer::new(1024 * 1024))
@@ -97,7 +99,27 @@ pub fn router(state: AppState) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(map_payload_limit_error))
         .layer(middleware::from_fn(set_security_headers))
+        .layer(middleware::from_fn_with_state(state.clone(), track_metrics))
         .with_state(state)
+}
+
+async fn track_metrics(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    state
+        .metrics
+        .total_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        state
+            .metrics
+            .error_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    response
 }
 
 async fn set_security_headers(request: Request<Body>, next: Next) -> Response {

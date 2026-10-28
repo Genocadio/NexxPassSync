@@ -617,15 +617,33 @@ pub async fn handle_sync_events(
     .await;
 
     let target_account_id = principal.account_id;
-    let rx = state.sync_notifier.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
-        Ok(notification) if notification.account_id == target_account_id => {
-            let data = serde_json::json!({
-                "seq": notification.seq,
-            });
-            Some(Ok(Event::default().event("sync").data(data.to_string())))
+    state
+        .metrics
+        .active_sse_connections
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let metrics_clone = state.metrics.clone();
+    struct SseDropGuard(std::sync::Arc<crate::state::Metrics>);
+    impl Drop for SseDropGuard {
+        fn drop(&mut self) {
+            self.0
+                .active_sse_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
-        _ => None,
+    }
+    let guard = std::sync::Arc::new(SseDropGuard(metrics_clone));
+
+    let rx = state.sync_notifier.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let _ = &guard;
+        match item {
+            Ok(notification) if notification.account_id == target_account_id => {
+                let data = serde_json::json!({
+                    "seq": notification.seq,
+                });
+                Some(Ok(Event::default().event("sync").data(data.to_string())))
+            }
+            _ => None,
+        }
     });
 
     Ok(Sse::new(stream).keep_alive(

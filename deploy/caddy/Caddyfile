@@ -1,0 +1,111 @@
+{
+    # Global options
+    email {$ACME_EMAIL:admin@nexxserve.dev}
+    admin off
+    servers {
+        trusted_proxies static private_ranges
+        metrics
+    }
+}
+
+{$SYNC_DOMAIN:pass.nexxserve.dev} {
+    # Automatic TLS with modern cipher suites
+    tls {
+        protocols tls1.3
+    }
+
+    # Strict Production Security Headers
+    header {
+        # HTTP Strict Transport Security (HSTS): 2 years + subdomains + preloading
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        # Prevent MIME type sniffing
+        X-Content-Type-Options "nosniff"
+        # Prevent clickjacking / iframe embedding
+        X-Frame-Options "DENY"
+        # Restrict referrer leakage
+        Referrer-Policy "no-referrer"
+        # Tight Content Security Policy for API server
+        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none';"
+        # Permissions Policy
+        Permissions-Policy "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+        # Remove server identity headers
+        -Server
+        -X-Powered-By
+    }
+
+    # Request size limits
+    request_body {
+        max_size 2MB
+    }
+
+    # Rate limiting & DDoS mitigation headers
+    @api {
+        path /v1/*
+    }
+
+    # Server-Sent Events (SSE) streaming endpoint optimization:
+    # Disable downstream buffering, disable compression, set immediate flush
+    @sse {
+        path /v1/sync/events
+    }
+    handle @sse {
+        header {
+            X-Accel-Buffering "no"
+            Cache-Control "no-cache, no-transform"
+        }
+        reverse_proxy sync-server:8080 {
+            flush_interval -1
+            transport http {
+                response_header_timeout 300s
+                read_timeout 300s
+                write_timeout 300s
+                keepalive 30s
+            }
+        }
+    }
+
+    # Metrics endpoint: Restrict to internal monitoring network or basic auth
+    @metrics {
+        path /metrics
+    }
+    handle @metrics {
+        @allowed_monitor {
+            remote_ip private_ranges 127.0.0.1
+        }
+        handle @allowed_monitor {
+            reverse_proxy sync-server:8080
+        }
+        handle {
+            respond "Unauthorized monitoring client" 403
+        }
+    }
+
+    # Health check endpoints
+    @health {
+        path /health*
+    }
+    handle @health {
+        reverse_proxy sync-server:8080
+    }
+
+    # General API endpoints
+    handle {
+        reverse_proxy sync-server:8080 {
+            transport http {
+                response_header_timeout 30s
+                read_timeout 30s
+                write_timeout 30s
+            }
+        }
+    }
+
+    # Access logging with metadata masking
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 50mb
+            roll_keep 10
+            roll_keep_for 30d
+        }
+        format json
+    }
+}

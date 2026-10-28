@@ -1,9 +1,31 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicI64, AtomicU64},
+    Arc,
+};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::broadcast;
 
 use crate::{config::Config, rate_limit::RateLimiter, replay::ReplayFilter};
+
+#[derive(Debug)]
+pub struct Metrics {
+    pub start_time: std::time::Instant,
+    pub total_requests: AtomicU64,
+    pub error_requests: AtomicU64,
+    pub active_sse_connections: AtomicI64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            start_time: std::time::Instant::now(),
+            total_requests: AtomicU64::new(0),
+            error_requests: AtomicU64::new(0),
+            active_sse_connections: AtomicI64::new(0),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct SyncNotification {
@@ -19,6 +41,7 @@ pub struct AppState {
     pub rate_limiter: RateLimiter,
     pub replay_filter: Arc<ReplayFilter>,
     pub sync_notifier: broadcast::Sender<SyncNotification>,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -47,6 +70,7 @@ impl AppState {
             rate_limiter: RateLimiter::new(),
             replay_filter: Arc::new(ReplayFilter::new()),
             sync_notifier,
+            metrics: Arc::new(Metrics::default()),
         })
     }
 
