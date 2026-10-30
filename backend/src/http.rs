@@ -108,7 +108,6 @@ pub fn router(state: AppState) -> Router {
         .merge(authenticated_routes);
     Router::new()
         .nest("/health", health::routes())
-        .route("/health", axum::routing::get(health::deep_health))
         .route("/metrics", axum::routing::get(health::metrics))
         .nest("/v1", api_v1)
         .fallback(|| async { StatusCode::NOT_FOUND })
