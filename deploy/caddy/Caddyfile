@@ -33,9 +33,9 @@
         -X-Powered-By
     }
 
-    # Request size limits
+    # Request size limits (16 MB for encrypted attachment uploads; 1 MB enforced in app for JSON routes)
     request_body {
-        max_size 2MB
+        max_size 16MB
     }
 
     # Rate limiting & DDoS mitigation headers

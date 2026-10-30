@@ -40,7 +40,7 @@ services:
       SYNC_MAINTENANCE_INTERVAL_SECONDS: "${SYNC_MAINTENANCE_INTERVAL_SECONDS:-3600}"
       RUST_LOG: "info,nexxpass_sync_server=debug"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health/ready || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
