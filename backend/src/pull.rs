@@ -47,6 +47,8 @@ pub struct ItemState {
     pub seq: u64,
     pub deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_proof: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub key_version: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob: Option<String>,
@@ -793,11 +795,11 @@ async fn fetch_page_items(
     // For every item touched by the raw prefix, return its latest state at or
     // before H (a mutable current row may already be past H).
     let rows = sqlx::query(
-        "SELECT c.item_id, c.version, c.seq, c.deleted, c.key_version, c.blob, \
+        "SELECT c.item_id, c.version, c.seq, c.deleted, c.delete_proof, c.key_version, c.blob, \
                 to_char(c.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at \
          FROM unnest($2::uuid[]) AS p(item_id) \
          CROSS JOIN LATERAL ( \
-             SELECT item_id, version, seq, deleted, key_version, blob, created_at \
+             SELECT item_id, version, seq, deleted, delete_proof, key_version, blob, created_at \
              FROM item_changes \
              WHERE account_id = $1 AND item_id = p.item_id AND seq <= $3 \
              ORDER BY seq DESC \
@@ -825,6 +827,7 @@ async fn fetch_page_items(
         let seq: i64 = row.try_get("seq")?;
         let key_version: i64 = row.try_get("key_version")?;
         let blob: Option<Vec<u8>> = row.try_get("blob")?;
+        let delete_proof: Option<Vec<u8>> = row.try_get("delete_proof")?;
         let updated_at: String = row.try_get("updated_at")?;
 
         let (kv_opt, blob_opt) = if deleted {
@@ -841,6 +844,11 @@ async fn fetch_page_items(
             version: version as u64,
             seq: seq as u64,
             deleted,
+            delete_proof: if deleted {
+                delete_proof.map(|proof| URL_SAFE_NO_PAD.encode(proof))
+            } else {
+                None
+            },
             key_version: kv_opt,
             blob: blob_opt,
             updated_at,

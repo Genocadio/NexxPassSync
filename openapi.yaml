@@ -137,6 +137,11 @@ components:
         blob:
           type: string
           description: Base64url-encoded ciphertext blob (552 to 65,536 bytes). Required when op=put.
+        delete_proof:
+          type: string
+          minLength: 86
+          maxLength: 86
+          description: Base64url Ed25519 signature from the account identity key over the account, item, and delete versions. Required when op=delete.
 
     OperationResult:
       type: object
@@ -313,7 +318,7 @@ paths:
   /v1/sync/pull:
     post:
       summary: Multi-Page Sync Pull
-      description: Fetches live vault items and tombstones using cursors, session management, and continuation tokens.
+      description: Fetches live vault items and tombstones using cursors, session management, and continuation tokens. Tombstones include an account-identity signature when available; legacy tombstones may omit it and should not be applied without verification.
       security:
         - NPSSv1Auth: []
       responses:

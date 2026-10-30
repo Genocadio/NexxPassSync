@@ -27,6 +27,23 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn delete_proof(
+    identity_key: &SigningKey,
+    account_id: &[u8],
+    item_id: Uuid,
+    base_version: u64,
+) -> String {
+    let version = base_version.checked_add(1).unwrap();
+    let message = format!(
+        "NexxPass/Tombstone/v1\n{}\n{}\n{}\n{}",
+        URL_SAFE_NO_PAD.encode(account_id),
+        item_id,
+        base_version,
+        version
+    );
+    URL_SAFE_NO_PAD.encode(identity_key.sign(message.as_bytes()).to_bytes())
+}
+
 fn sign_request(
     method: &str,
     path: &str,
@@ -263,6 +280,7 @@ async fn test_full_batch_sync_lifecycle() {
                 "operation_id": op_id_2.to_string(),
                 "item_id": item_id_1.to_string(),
                 "base_version": 1,
+                "delete_proof": delete_proof(&identity_key, &account_id, item_id_1, 1),
             }
         ]
     });

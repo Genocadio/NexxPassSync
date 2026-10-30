@@ -6,6 +6,7 @@ use axum::{
     Extension, Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -39,6 +40,7 @@ pub struct MutationRequest {
     pub base_version: u64,
     pub key_version: Option<u64>,
     pub blob: Option<String>,
+    pub delete_proof: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -62,7 +64,9 @@ pub enum ParsedOp {
         decoded_blob: Vec<u8>,
         payload_digest: [u8; 32],
     },
-    Delete,
+    Delete {
+        proof: Vec<u8>,
+    },
 }
 
 pub struct ValidatedMutation {
@@ -125,6 +129,9 @@ pub async fn handle_sync_batch(
 
         match op.op.as_str() {
             "put" => {
+                if op.delete_proof.is_some() {
+                    return Err(AppError::InvalidInput);
+                }
                 let Some(kv) = op.key_version else {
                     return Err(AppError::InvalidInput);
                 };
@@ -175,6 +182,15 @@ pub async fn handle_sync_batch(
                 if op.key_version.is_some() || op.blob.is_some() {
                     return Err(AppError::InvalidInput);
                 }
+                let Some(proof) = &op.delete_proof else {
+                    return Err(AppError::InvalidInput);
+                };
+                let decoded_proof = URL_SAFE_NO_PAD
+                    .decode(proof)
+                    .map_err(|_| AppError::InvalidInput)?;
+                if URL_SAFE_NO_PAD.encode(&decoded_proof) != *proof || decoded_proof.len() != 64 {
+                    return Err(AppError::InvalidInput);
+                }
                 let zero_digest = [0u8; 32];
                 let op_hash = compute_operation_hash(
                     &account_id,
@@ -189,7 +205,9 @@ pub async fn handle_sync_batch(
                     operation_id: operation_uuid,
                     item_id: item_uuid,
                     base_version: op.base_version,
-                    op: ParsedOp::Delete,
+                    op: ParsedOp::Delete {
+                        proof: decoded_proof,
+                    },
                     op_hash,
                 });
             }
@@ -201,7 +219,7 @@ pub async fn handle_sync_batch(
 
     // Global lock order: lock accounts row first.
     let account_row = sqlx::query(
-        "SELECT status, active_key_version, rotation_mode, rotation_target_key_version, seq_counter \
+        "SELECT status, identity_ed25519_pub, active_key_version, rotation_mode, rotation_target_key_version, seq_counter \
          FROM accounts \
          WHERE account_id = $1 \
          FOR UPDATE",
@@ -220,6 +238,19 @@ pub async fn handle_sync_batch(
     }
     if status == "deletion_pending" {
         return Err(AppError::AccountDeletionPending);
+    }
+
+    let identity_public_key: Vec<u8> = account_row.try_get("identity_ed25519_pub")?;
+    for mutation in &validated_mutations {
+        if let ParsedOp::Delete { proof } = &mutation.op {
+            verify_delete_proof(
+                &identity_public_key,
+                proof,
+                &account_id,
+                &mutation.item_id,
+                mutation.base_version,
+            )?;
+        }
     }
 
     // Re-verify device active state inside account lock transaction.
@@ -472,7 +503,7 @@ pub async fn handle_sync_batch(
                     seq: Some(seq_counter as u64),
                 });
             }
-            ParsedOp::Delete => {
+            ParsedOp::Delete { proof } => {
                 let Some(item_row) = current_item else {
                     let status = if mutation.base_version > 0 {
                         "item_gone"
@@ -540,13 +571,14 @@ pub async fn handle_sync_batch(
                 .await?;
 
                 sqlx::query(
-                    "INSERT INTO item_changes (account_id, seq, item_id, version, key_version, blob, deleted, created_at) \
-                     VALUES ($1, $2, $3, $4, 0, NULL, TRUE, now())",
+                    "INSERT INTO item_changes (account_id, seq, item_id, version, key_version, blob, deleted, delete_proof, created_at) \
+                     VALUES ($1, $2, $3, $4, 0, NULL, TRUE, $5, now())",
                 )
                 .bind(&account_id)
                 .bind(seq_counter)
                 .bind(mutation.item_id)
                 .bind(next_version as i64)
+                .bind(proof)
                 .execute(&mut *tx)
                 .await?;
 
@@ -659,4 +691,91 @@ pub(crate) fn parse_canonical_uuid(value: &str) -> Result<Uuid, AppError> {
         return Err(AppError::InvalidInput);
     }
     Ok(uuid)
+}
+
+pub(crate) fn delete_proof_message(
+    account_id: &[u8],
+    item_id: &Uuid,
+    base_version: u64,
+    version: u64,
+) -> Vec<u8> {
+    format!(
+        "NexxPass/Tombstone/v1\n{}\n{}\n{}\n{}",
+        URL_SAFE_NO_PAD.encode(account_id),
+        item_id,
+        base_version,
+        version
+    )
+    .into_bytes()
+}
+
+fn verify_delete_proof(
+    public_key: &[u8],
+    proof: &[u8],
+    account_id: &[u8],
+    item_id: &Uuid,
+    base_version: u64,
+) -> Result<(), AppError> {
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| AppError::InvalidSignature)?;
+    let identity_key =
+        VerifyingKey::from_bytes(&public_key).map_err(|_| AppError::InvalidSignature)?;
+    let signature = Signature::from_slice(proof).map_err(|_| AppError::InvalidSignature)?;
+    let version = base_version.checked_add(1).ok_or(AppError::InvalidInput)?;
+    identity_key
+        .verify(
+            &delete_proof_message(account_id, item_id, base_version, version),
+            &signature,
+        )
+        .map_err(|_| AppError::InvalidSignature)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn delete_proofs_are_bound_to_account_item_and_version() {
+        let key = SigningKey::from_bytes(&[0x42; 32]);
+        let account_id = [0x24; 32];
+        let item_id = Uuid::parse_str("c4b0d7b4-9c27-4ed8-9d8b-22499e436a20").unwrap();
+        let message = delete_proof_message(&account_id, &item_id, 4, 5);
+        let signature = key.sign(&message);
+        let verifying_key = key.verifying_key();
+
+        assert!(verify_delete_proof(
+            &verifying_key.to_bytes(),
+            &signature.to_bytes(),
+            &account_id,
+            &item_id,
+            4
+        )
+        .is_ok());
+        assert!(verify_delete_proof(
+            &verifying_key.to_bytes(),
+            &signature.to_bytes(),
+            &account_id,
+            &item_id,
+            5
+        )
+        .is_err());
+        assert!(verify_delete_proof(
+            &verifying_key.to_bytes(),
+            &signature.to_bytes(),
+            &[0x25; 32],
+            &item_id,
+            4
+        )
+        .is_err());
+        assert!(verify_delete_proof(
+            &verifying_key.to_bytes(),
+            &signature.to_bytes(),
+            &account_id,
+            &Uuid::new_v4(),
+            4
+        )
+        .is_err());
+    }
 }

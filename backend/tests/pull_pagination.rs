@@ -25,9 +25,27 @@ use uuid::Uuid;
 
 struct TestEnv {
     router: axum::Router,
+    identity_key: SigningKey,
     device_key: SigningKey,
     account_id: [u8; 32],
     device_id: Uuid,
+}
+
+fn delete_proof(
+    identity_key: &SigningKey,
+    account_id: &[u8],
+    item_id: Uuid,
+    base_version: u64,
+) -> String {
+    let version = base_version.checked_add(1).unwrap();
+    let message = format!(
+        "NexxPass/Tombstone/v1\n{}\n{}\n{}\n{}",
+        URL_SAFE_NO_PAD.encode(account_id),
+        item_id,
+        base_version,
+        version
+    );
+    URL_SAFE_NO_PAD.encode(identity_key.sign(message.as_bytes()).to_bytes())
 }
 
 fn sign_request(
@@ -150,6 +168,7 @@ async fn setup() -> Option<TestEnv> {
 
     Some(TestEnv {
         router,
+        identity_key,
         device_key,
         account_id,
         device_id,
@@ -200,6 +219,12 @@ impl TestEnv {
                     "operation_id": Uuid::new_v4().to_string(),
                     "item_id": item_id.to_string(),
                     "base_version": base_version,
+                    "delete_proof": delete_proof(
+                        &self.identity_key,
+                        &self.account_id,
+                        item_id,
+                        base_version
+                    ),
                 }]
             }),
         )
