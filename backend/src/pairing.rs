@@ -113,6 +113,7 @@ pub async fn create_pairing_challenge(
     let ed25519_pub = decode_exact(&request.device_ed25519_pub, 32)?;
     let x25519_pub = decode_exact(&request.device_x25519_pub, 32)?;
     validate_ed25519_public_key(&ed25519_pub)?;
+    validate_x25519_public_key(&x25519_pub)?;
     if request.device_label.is_empty()
         || request.device_label.chars().count() > 100
         || request.device_label.contains('\0')
@@ -130,9 +131,12 @@ pub async fn create_pairing_challenge(
         .bind(&target_account_id)
         .fetch_one(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM pairing_challenges WHERE expires_at <= now()")
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "DELETE FROM pairing_challenges WHERE target_account_id = $1 AND expires_at <= now()",
+    )
+    .bind(&target_account_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "INSERT INTO pairing_challenges \
          (pairing_id, target_account_id, device_id, device_pub_digest, device_label, expires_at) \
@@ -368,20 +372,53 @@ pub async fn submit_pairing_relay(
         return Err(AppError::InvalidInput);
     }
 
-    sqlx::query(
+    state.rate_limiter.check_rate_limit(
+        &format!(
+            "relay_submit:{}",
+            URL_SAFE_NO_PAD.encode(&principal.account_id)
+        ),
+        30,
+        std::time::Duration::from_secs(60),
+    )?;
+
+    let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
+
+    // Ensure the target device_id belongs to this account (either registered on
+    // the account or tied to a pairing challenge for this target account).
+    let belongs_to_account: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM devices WHERE account_id = $1 AND device_id = $2) \
+         OR EXISTS(SELECT 1 FROM pairing_challenges WHERE target_account_id = $1 AND device_id = $2)",
+    )
+    .bind(&principal.account_id)
+    .bind(device_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if !belongs_to_account {
+        return Err(AppError::PairingChallengeInvalid);
+    }
+
+    let res = sqlx::query(
         "INSERT INTO pairing_relays (device_id, account_id, encrypted_payload, created_at, expires_at) \
          VALUES ($1, $2, $3, now(), now() + interval '10 minutes') \
          ON CONFLICT (device_id) DO UPDATE SET \
-             account_id = EXCLUDED.account_id, \
              encrypted_payload = EXCLUDED.encrypted_payload, \
              created_at = now(), \
-             expires_at = now() + interval '10 minutes'",
+             expires_at = now() + interval '10 minutes' \
+         WHERE pairing_relays.account_id = EXCLUDED.account_id",
     )
     .bind(device_id)
     .bind(&principal.account_id)
     .bind(&request.encrypted_payload)
-    .execute(&state.database)
+    .execute(&mut *tx)
     .await?;
+
+    if res.rows_affected() != 1 {
+        return Err(AppError::PairingChallengeInvalid);
+    }
+
+    tx.commit().await?;
 
     Ok(Json(RelaySubmitResponse {
         status: "stored".to_string(),
@@ -393,6 +430,12 @@ pub async fn get_pairing_relay(
     Path(device_id_str): Path<String>,
 ) -> Result<Json<RelayStatusResponse>, AppError> {
     let device_id = parse_canonical_uuid(&device_id_str)?;
+
+    state.rate_limiter.check_rate_limit(
+        &format!("relay_poll:{device_id}"),
+        60,
+        std::time::Duration::from_secs(60),
+    )?;
 
     let row = sqlx::query(
         "SELECT encrypted_payload FROM pairing_relays \
@@ -446,6 +489,7 @@ fn validate_approval(request: ApprovalRequest) -> Result<ValidatedApproval, AppE
     let ed25519_pub = decode_exact(&request.device_ed25519_pub, 32)?;
     let x25519_pub = decode_exact(&request.device_x25519_pub, 32)?;
     validate_ed25519_public_key(&ed25519_pub)?;
+    validate_x25519_public_key(&x25519_pub)?;
     if request.active_key_version < 1 || request.active_key_version > u32::MAX as i64 {
         return Err(AppError::InvalidInput);
     }
@@ -505,6 +549,13 @@ fn decode_exact(value: &str, expected_len: usize) -> Result<Vec<u8>, AppError> {
 fn validate_ed25519_public_key(bytes: &[u8]) -> Result<(), AppError> {
     let key: [u8; 32] = bytes.try_into().map_err(|_| AppError::InvalidInput)?;
     VerifyingKey::from_bytes(&key).map_err(|_| AppError::InvalidInput)?;
+    Ok(())
+}
+
+fn validate_x25519_public_key(bytes: &[u8]) -> Result<(), AppError> {
+    if bytes.len() != 32 || bytes.iter().all(|&b| b == 0) {
+        return Err(AppError::InvalidInput);
+    }
     Ok(())
 }
 

@@ -93,7 +93,16 @@ pub async fn register_account(
         &body,
         &validated.identity_ed25519_pub,
     )?;
-    consume_nonce(&state, &validated.identity_ed25519_pub, &nonce).await?;
+
+    state.rate_limiter.check_rate_limit(
+        &format!("register:{}", URL_SAFE_NO_PAD.encode(&validated.account_id)),
+        10,
+        std::time::Duration::from_secs(60),
+    )?;
+
+    let mut principal_id = validated.account_id.clone();
+    principal_id.extend_from_slice(b"identity");
+    consume_nonce(&state, &principal_id, &nonce).await?;
 
     let mut tx = state.database.begin().await?;
     let retired: bool =
@@ -143,6 +152,8 @@ fn validate_registration(request: RegistrationRequest) -> Result<ValidatedRegist
     let device_wrap = decode_exact(&request.device.wrap, 105)?;
     validate_ed25519_public_key(&identity_ed25519_pub)?;
     validate_ed25519_public_key(&device_ed25519_pub)?;
+    validate_x25519_public_key(&identity_x25519_pub)?;
+    validate_x25519_public_key(&device_x25519_pub)?;
 
     Ok(ValidatedRegistration {
         account_id,
@@ -230,5 +241,12 @@ fn decode_exact(value: &str, expected: usize) -> Result<Vec<u8>, AppError> {
 fn validate_ed25519_public_key(bytes: &[u8]) -> Result<(), AppError> {
     let key: [u8; 32] = bytes.try_into().map_err(|_| AppError::InvalidInput)?;
     VerifyingKey::from_bytes(&key).map_err(|_| AppError::InvalidInput)?;
+    Ok(())
+}
+
+fn validate_x25519_public_key(bytes: &[u8]) -> Result<(), AppError> {
+    if bytes.len() != 32 || bytes.iter().all(|&b| b == 0) {
+        return Err(AppError::InvalidInput);
+    }
     Ok(())
 }

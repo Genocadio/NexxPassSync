@@ -9,10 +9,14 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+use unicode_normalization::is_nfc;
 use uuid::Uuid;
 
 use crate::{
-    auth::{decode_exact, hex_lower, AuthenticatedPrincipal, PrincipalKind},
+    auth::{
+        decode_exact, hex_lower, lock_active_device_for_mutation, AuthenticatedPrincipal,
+        PrincipalKind,
+    },
     error::AppError,
     state::AppState,
 };
@@ -44,6 +48,17 @@ pub struct RecoveryDeviceRegistration {
 pub struct DeviceRegistrationResult {
     pub device_id: String,
     pub active_key_version: i64,
+}
+
+#[derive(Serialize)]
+pub struct DisableSyncResult {
+    pub account_id: String,
+    pub status: String,
+    pub local_mode: &'static str,
+    pub other_devices_revoked: u64,
+    pub vault_purged: bool,
+    pub re_enable_requires_new_account: bool,
+    pub re_enable_notice: &'static str,
 }
 
 #[derive(Serialize)]
@@ -120,6 +135,9 @@ pub async fn get_recovery_wraps(
     if status == "suspended" {
         return Err(AppError::AccountSuspended);
     }
+    if status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
+    }
 
     let rows = sqlx::query(
         "SELECT key_version, recipient, status, wrap FROM key_wraps \
@@ -190,7 +208,13 @@ pub async fn register_device_recovery(
         decode_exact(&request.device_ed25519_pub, 32).map_err(|_| AppError::MalformedRequest)?;
     let device_x25519_pub =
         decode_exact(&request.device_x25519_pub, 32).map_err(|_| AppError::MalformedRequest)?;
-    if request.device_label.is_empty() || request.device_label.chars().count() > 100 {
+    validate_ed25519_public_key(&device_ed25519_pub)?;
+    validate_x25519_public_key(&device_x25519_pub)?;
+    if request.device_label.is_empty()
+        || request.device_label.chars().count() > 100
+        || request.device_label.contains('\0')
+        || !is_nfc(&request.device_label)
+    {
         return Err(AppError::InvalidInput);
     }
     let wrap = decode_exact(&request.wrap, 105).map_err(|_| AppError::InvalidInput)?;
@@ -220,6 +244,9 @@ pub async fn register_device_recovery(
     }
     if status == "suspended" {
         return Err(AppError::AccountSuspended);
+    }
+    if status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
     }
     if status == "identity_locked" {
         return Err(AppError::IdentityLocked);
@@ -399,6 +426,7 @@ pub async fn list_devices(
 pub async fn revoke_device(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Path(target_device_id_str): Path<String>,
 ) -> Result<Json<DeviceRegistrationResult>, AppError> {
     if principal.kind != PrincipalKind::Device {
@@ -412,25 +440,48 @@ pub async fn revoke_device(
     }
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
-    let account_row = sqlx::query(
-        "SELECT status, active_key_version FROM accounts WHERE account_id = $1 FOR UPDATE",
+    let caller_pub_bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT device_ed25519_pub FROM devices WHERE account_id = $1 AND device_id = $2",
     )
     .bind(&principal.account_id)
-    .fetch_optional(&mut *tx)
+    .bind(caller_device_id)
+    .fetch_one(&mut *tx)
     .await?;
-    let Some(account_row) = account_row else {
-        return Err(AppError::InvalidSignature);
-    };
 
-    let status: String = account_row.try_get("status")?;
-    if status == "deletion_pending" {
-        return Err(AppError::AccountDeletionPending);
+    let mut revocation_proof_bytes: Option<Vec<u8>> = None;
+    let mut revocation_proof_b64u: Option<String> = None;
+    if let Some(proof_header) = headers.get("x-nexxpass-revocation-proof") {
+        let proof_str = proof_header
+            .to_str()
+            .map_err(|_| AppError::MalformedRequest)?;
+        let sig_bytes = decode_exact(proof_str, 64).map_err(|_| AppError::MalformedRequest)?;
+        let signature =
+            Signature::from_slice(&sig_bytes).map_err(|_| AppError::MalformedRequest)?;
+        let pub_arr: [u8; 32] = caller_pub_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::InvalidSignature)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&pub_arr).map_err(|_| AppError::InvalidSignature)?;
+        let preimage = format!(
+            "NPSRevoke1\n{}\n{}",
+            URL_SAFE_NO_PAD.encode(&principal.account_id),
+            target_device_id
+        );
+        verifying_key
+            .verify_strict(preimage.as_bytes(), &signature)
+            .map_err(|_| AppError::InvalidSignature)?;
+        revocation_proof_bytes = Some(sig_bytes);
+        revocation_proof_b64u = Some(proof_str.to_string());
     }
-    if status == "suspended" {
-        return Err(AppError::AccountSuspended);
-    }
-    let active_key_version: i64 = account_row.try_get("active_key_version")?;
+
+    let active_key_version: i64 =
+        sqlx::query_scalar("SELECT active_key_version FROM accounts WHERE account_id = $1")
+            .bind(&principal.account_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
     let dev_row = sqlx::query(
         "SELECT (revoked_at IS NOT NULL) AS is_revoked FROM devices \
@@ -448,11 +499,17 @@ pub async fn revoke_device(
     let is_revoked: bool = dev_row.try_get("is_revoked")?;
     if !is_revoked {
         sqlx::query(
-            "UPDATE devices SET revoked_at = now(), revoked_reason = 'user_revocation' \
+            "UPDATE devices \
+             SET revoked_at = now(), \
+                 revoked_reason = 'user_revocation', \
+                 revoked_by_device_id = $3, \
+                 revocation_proof = $4 \
              WHERE account_id = $1 AND device_id = $2",
         )
         .bind(&principal.account_id)
         .bind(target_device_id)
+        .bind(caller_device_id)
+        .bind(&revocation_proof_bytes)
         .execute(&mut *tx)
         .await?;
 
@@ -500,9 +557,214 @@ pub async fn revoke_device(
 
     tx.commit().await?;
 
+    if !is_revoked {
+        let _ = state.sync_notifier.send(crate::state::SyncNotification {
+            account_id: principal.account_id,
+            seq: None,
+            revoked_device_id: Some(target_device_id),
+            revoked_reason: Some("user_revocation".to_string()),
+            revocation_proof: revocation_proof_b64u,
+        });
+    }
+
     Ok(Json(DeviceRegistrationResult {
         device_id: target_device_id.to_string(),
         active_key_version,
+    }))
+}
+
+/// POST /v1/accounts/disable-sync
+/// Turns off cloud sync from the calling device:
+/// 1. Immediately purges all encrypted vault items, item history, attachments, wraps, and sync sessions.
+/// 2. Revokes all other devices on the account (`revoked_reason = 'sync_disabled'`) and broadcasts
+///    `event: revoked` (`wipe_required: true`) over SSE so other devices immediately erase their
+///    local vaults and reset to the onboarding start page (or on next contact within their 7-day lease).
+/// 3. Transitions the account to `status = 'sync_disabled'` so re-enabling sync later requires
+///    registering a brand new sync account.
+pub async fn disable_sync(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
+) -> Result<Json<DisableSyncResult>, AppError> {
+    if principal.kind != PrincipalKind::Device {
+        return Err(AppError::InvalidSignature);
+    }
+    let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
+
+    let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
+
+    let caller_pub_bytes: Vec<u8> = sqlx::query_scalar(
+        "SELECT device_ed25519_pub FROM devices WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(&principal.account_id)
+    .bind(caller_device_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let mut revocation_proof_bytes: Option<Vec<u8>> = None;
+    let mut revocation_proof_b64u: Option<String> = None;
+    if let Some(proof_header) = headers.get("x-nexxpass-revocation-proof") {
+        let proof_str = proof_header
+            .to_str()
+            .map_err(|_| AppError::MalformedRequest)?;
+        let sig_bytes = decode_exact(proof_str, 64).map_err(|_| AppError::MalformedRequest)?;
+        let signature =
+            Signature::from_slice(&sig_bytes).map_err(|_| AppError::MalformedRequest)?;
+        let pub_arr: [u8; 32] = caller_pub_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| AppError::InvalidSignature)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&pub_arr).map_err(|_| AppError::InvalidSignature)?;
+        let preimage = format!(
+            "NPSDisableSync1\n{}",
+            URL_SAFE_NO_PAD.encode(&principal.account_id)
+        );
+        verifying_key
+            .verify_strict(preimage.as_bytes(), &signature)
+            .map_err(|_| AppError::InvalidSignature)?;
+        revocation_proof_bytes = Some(sig_bytes);
+        revocation_proof_b64u = Some(proof_str.to_string());
+    }
+
+    // Lock and collect all other active devices on the account to revoke & notify.
+    let other_device_rows = sqlx::query(
+        "SELECT device_id FROM devices \
+         WHERE account_id = $1 AND device_id <> $2 AND revoked_at IS NULL \
+         FOR UPDATE",
+    )
+    .bind(&principal.account_id)
+    .bind(caller_device_id)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut other_device_ids = Vec::with_capacity(other_device_rows.len());
+    for row in other_device_rows {
+        other_device_ids.push(row.try_get::<Uuid, _>("device_id")?);
+    }
+
+    // Revoke all other devices with 'sync_disabled' so they wipe on next contact or SSE event.
+    sqlx::query(
+        "UPDATE devices \
+         SET revoked_at = now(), \
+             revoked_reason = 'sync_disabled', \
+             revoked_by_device_id = $2, \
+             revocation_proof = $3 \
+         WHERE account_id = $1 AND device_id <> $2 AND revoked_at IS NULL",
+    )
+    .bind(&principal.account_id)
+    .bind(caller_device_id)
+    .bind(&revocation_proof_bytes)
+    .execute(&mut *tx)
+    .await?;
+
+    // Mark the calling device as 'sync_disabled_self'.
+    sqlx::query(
+        "UPDATE devices \
+         SET revoked_at = now(), \
+             revoked_reason = 'sync_disabled_self', \
+             revoked_by_device_id = $2 \
+         WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(&principal.account_id)
+    .bind(caller_device_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Immediately purge all encrypted vault items, history, attachments, wraps, sessions, and pairings.
+    sqlx::query("DELETE FROM items WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM item_changes WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM attachment_blobs WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM operations WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM retired_item_ids WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM key_wraps WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sync_sessions WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM pairing_challenges WHERE target_account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM pairing_relays WHERE account_id = $1")
+        .bind(&principal.account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE rotation_participants SET revoked_at = now() \
+         WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&principal.account_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Transition account to 'sync_disabled' and reset any rotation state.
+    sqlx::query(
+        "UPDATE accounts SET \
+             status = 'sync_disabled', \
+             sync_disabled_at = now(), \
+             rotation_mode = 'idle', \
+             rotation_target_key_version = NULL, \
+             rotation_owner_device_id = NULL, \
+             rotation_lease_expires_at = NULL, \
+             rotation_deadline = NULL, \
+             rotation_started_at = NULL \
+         WHERE account_id = $1",
+    )
+    .bind(&principal.account_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let event_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO account_events (account_id, event_id, event_type, actor, actor_device_id) \
+         VALUES ($1, $2, 'sync_disabled', 'device', $3)",
+    )
+    .bind(&principal.account_id)
+    .bind(event_id)
+    .bind(caller_device_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    for other_dev_id in &other_device_ids {
+        let _ = state.sync_notifier.send(crate::state::SyncNotification {
+            account_id: principal.account_id.clone(),
+            seq: None,
+            revoked_device_id: Some(*other_dev_id),
+            revoked_reason: Some("sync_disabled".to_string()),
+            revocation_proof: revocation_proof_b64u.clone(),
+        });
+    }
+
+    Ok(Json(DisableSyncResult {
+        account_id: URL_SAFE_NO_PAD.encode(&principal.account_id),
+        status: "sync_disabled".to_string(),
+        local_mode: "offline_only",
+        other_devices_revoked: other_device_ids.len() as u64,
+        vault_purged: true,
+        re_enable_requires_new_account: true,
+        re_enable_notice: "Sync has been turned off and all other devices have been revoked. Re-enabling sync later will register a brand new sync account.",
     }))
 }
 
@@ -517,22 +779,13 @@ pub async fn lock_account(
     let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
-    let account_row = sqlx::query("SELECT status FROM accounts WHERE account_id = $1 FOR UPDATE")
-        .bind(&principal.account_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let Some(account_row) = account_row else {
-        return Err(AppError::InvalidSignature);
-    };
-
-    let current_status: String = account_row.try_get("status")?;
-    if current_status == "deletion_pending" {
-        return Err(AppError::AccountDeletionPending);
-    }
-    if current_status == "suspended" {
-        return Err(AppError::AccountSuspended);
-    }
+    let current_status: String =
+        sqlx::query_scalar("SELECT status FROM accounts WHERE account_id = $1")
+            .bind(&principal.account_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
     if current_status != "identity_locked" {
         sqlx::query("UPDATE accounts SET status = 'identity_locked' WHERE account_id = $1")
@@ -580,6 +833,8 @@ pub async fn migrate_identity(
         decode_exact(&request.identity_ed25519_pub, 32).map_err(|_| AppError::MalformedRequest)?;
     let identity_x25519_pub =
         decode_exact(&request.identity_x25519_pub, 32).map_err(|_| AppError::MalformedRequest)?;
+    validate_ed25519_public_key(&identity_ed25519_pub)?;
+    validate_x25519_public_key(&identity_x25519_pub)?;
     if request.derivation_version <= 0 {
         return Err(AppError::InvalidInput);
     }
@@ -590,6 +845,7 @@ pub async fn migrate_identity(
     let wrap_bytes = decode_exact(&recovery_wrap.wrap, 105).map_err(|_| AppError::InvalidInput)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT status, active_key_version, rotation_mode, identity_ed25519_pub \
@@ -609,6 +865,9 @@ pub async fn migrate_identity(
     }
     if status == "suspended" {
         return Err(AppError::AccountSuspended);
+    }
+    if status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
     }
     let rotation_mode: String = account_row.try_get("rotation_mode")?;
     if rotation_mode != "idle" {
@@ -723,9 +982,15 @@ pub async fn delete_account(
     if status == "suspended" {
         return Err(AppError::AccountSuspended);
     }
+    if status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
+    }
 
-    if principal.kind == PrincipalKind::Device && status != "identity_locked" {
-        return Err(AppError::InvalidSignature);
+    if principal.kind == PrincipalKind::Device {
+        if status != "identity_locked" {
+            return Err(AppError::InvalidSignature);
+        }
+        verify_caller_device_not_revoked(&mut tx, &principal).await?;
     }
 
     if status == "deletion_pending" {
@@ -796,6 +1061,10 @@ pub async fn cancel_deletion(
         return Err(AppError::Conflict);
     }
 
+    if principal.kind == PrincipalKind::Device {
+        verify_caller_device_not_revoked(&mut tx, &principal).await?;
+    }
+
     sqlx::query(
         "UPDATE accounts \
          SET status = 'active', deletion_requested_at = NULL \
@@ -829,4 +1098,37 @@ pub async fn cancel_deletion(
         status: "active".to_string(),
         deletion_requested_at: None,
     }))
+}
+
+async fn verify_caller_device_not_revoked(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    principal: &AuthenticatedPrincipal,
+) -> Result<(), AppError> {
+    let device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
+    let revoked: Option<bool> = sqlx::query_scalar(
+        "SELECT revoked_at IS NOT NULL FROM devices \
+         WHERE account_id = $1 AND device_id = $2 FOR UPDATE",
+    )
+    .bind(&principal.account_id)
+    .bind(device_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    match revoked {
+        Some(false) => Ok(()),
+        Some(true) => Err(AppError::DeviceRevoked),
+        None => Err(AppError::InvalidSignature),
+    }
+}
+
+fn validate_ed25519_public_key(bytes: &[u8]) -> Result<(), AppError> {
+    let key: [u8; 32] = bytes.try_into().map_err(|_| AppError::InvalidInput)?;
+    VerifyingKey::from_bytes(&key).map_err(|_| AppError::InvalidInput)?;
+    Ok(())
+}
+
+fn validate_x25519_public_key(bytes: &[u8]) -> Result<(), AppError> {
+    if bytes.len() != 32 || bytes.iter().all(|&b| b == 0) {
+        return Err(AppError::InvalidInput);
+    }
+    Ok(())
 }

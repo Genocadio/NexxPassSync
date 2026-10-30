@@ -12,10 +12,19 @@ pub enum AppError {
     MalformedRequest,
     #[error("unsupported protocol version")]
     UnsupportedProtocolVersion,
+    #[error("client update required for signed deletion support")]
+    DeleteProofRequired,
     #[error("invalid signature")]
     InvalidSignature,
     #[error("device revoked")]
     DeviceRevoked,
+    #[error("device revoked")]
+    DeviceRevokedWithDetails {
+        reason: Option<String>,
+        revocation_proof: Option<String>,
+    },
+    #[error("sync disabled")]
+    SyncDisabled,
     #[error("identity locked")]
     IdentityLocked,
     #[error("account suspended")]
@@ -64,10 +73,23 @@ struct ErrorBody {
     request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_s: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wipe_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revoked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revocation_proof: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    re_enable_requires_new_account: Option<bool>,
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        let mut wipe_required = None;
+        let mut revoked_reason = None;
+        let mut revocation_proof = None;
+        let mut re_enable_requires_new_account = None;
+
         let (status, code, message, retry_after_s) = match self {
             Self::MalformedRequest => (
                 StatusCode::BAD_REQUEST,
@@ -81,18 +103,50 @@ impl IntoResponse for AppError {
                 "Unsupported protocol version.",
                 None,
             ),
+            Self::DeleteProofRequired => (
+                StatusCode::UPGRADE_REQUIRED,
+                "delete_proof_required",
+                "Update the client to a version that supports signed deletions.",
+                None,
+            ),
             Self::InvalidSignature => (
                 StatusCode::UNAUTHORIZED,
                 "invalid_signature",
                 "Authentication failed.",
                 None,
             ),
-            Self::DeviceRevoked => (
-                StatusCode::FORBIDDEN,
-                "device_revoked",
-                "This device has been revoked.",
-                None,
-            ),
+            Self::DeviceRevoked => {
+                wipe_required = Some(true);
+                (
+                    StatusCode::FORBIDDEN,
+                    "device_revoked",
+                    "This device has been revoked. Erase local vault data and reset to start page.",
+                    None,
+                )
+            }
+            Self::DeviceRevokedWithDetails {
+                reason,
+                revocation_proof: proof,
+            } => {
+                wipe_required = Some(true);
+                revoked_reason = reason;
+                revocation_proof = proof;
+                (
+                    StatusCode::FORBIDDEN,
+                    "device_revoked",
+                    "This device has been revoked. Erase local vault data and reset to start page.",
+                    None,
+                )
+            }
+            Self::SyncDisabled => {
+                re_enable_requires_new_account = Some(true);
+                (
+                    StatusCode::FORBIDDEN,
+                    "sync_disabled",
+                    "Sync has been disabled for this account. Register a new account to resume syncing.",
+                    None,
+                )
+            }
             Self::IdentityLocked => (
                 StatusCode::FORBIDDEN,
                 "identity_locked",
@@ -197,6 +251,7 @@ impl IntoResponse for AppError {
             ),
         };
         let request_id = uuid::Uuid::new_v4().to_string();
+        let proof_header = revocation_proof.clone();
         let mut response = (
             status,
             Json(ErrorEnvelope {
@@ -205,6 +260,10 @@ impl IntoResponse for AppError {
                     message,
                     request_id: request_id.clone(),
                     retry_after_s,
+                    wipe_required,
+                    revoked_reason,
+                    revocation_proof,
+                    re_enable_requires_new_account,
                 },
             }),
         )
@@ -213,6 +272,20 @@ impl IntoResponse for AppError {
             response
                 .headers_mut()
                 .insert(HeaderName::from_static("x-request-id"), value);
+        }
+        if wipe_required == Some(true) {
+            response.headers_mut().insert(
+                HeaderName::from_static("x-nexxpass-wipe-vault"),
+                HeaderValue::from_static("true"),
+            );
+        }
+        if let Some(proof) = proof_header {
+            if let Ok(value) = HeaderValue::from_str(&proof) {
+                response.headers_mut().insert(
+                    HeaderName::from_static("x-nexxpass-revocation-proof"),
+                    value,
+                );
+            }
         }
         if let Some(seconds) = retry_after_s {
             if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
@@ -230,5 +303,23 @@ impl From<sqlx::Error> for AppError {
         // Database error text may expose schema/query details; keep it out of logs.
         tracing::error!("database operation failed");
         Self::Unavailable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn missing_delete_proof_returns_an_explicit_client_upgrade_error() {
+        let response = AppError::DeleteProofRequired.into_response();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "delete_proof_required");
     }
 }

@@ -171,6 +171,49 @@ components:
           type: integer
           description: Monotonic sequence revision number of the committed account change.
 
+  EncryptedAttachmentUpload:
+    type: object
+    additionalProperties: false
+    required: [key_version, blob]
+    properties:
+      key_version:
+        type: integer
+        minimum: 1
+      blob:
+        type: string
+        format: byte
+        description: Base64url-encoded XChaCha20-Poly1305 envelope; server cannot decrypt it.
+
+  EncryptedAttachment:
+    type: object
+    required: [record_id, attachment_id, key_version, blob]
+    properties:
+      record_id:
+        type: string
+        format: uuid
+      attachment_id:
+        type: string
+        format: uuid
+      key_version:
+        type: integer
+        minimum: 1
+      blob:
+        type: string
+        format: byte
+
+  AttachmentReconcileRequest:
+    type: object
+    additionalProperties: false
+    required: [keep_ids]
+    properties:
+      keep_ids:
+        type: array
+        maxItems: 100
+        uniqueItems: true
+        items:
+          type: string
+          format: uuid
+
 paths:
   /health/live:
     get:
@@ -234,12 +277,37 @@ paths:
   /v1/accounts/me:
     get:
       summary: Get Account State
-      description: Returns active key version, keyring version, rotation state, device info, and key wraps.
+      description: Returns active key version, keyring version, rotation state, device info, 7-day offline lease policy (`sync_policy`), and key wraps.
       security:
         - NPSSv1Auth: []
       responses:
         '200':
-          description: Account metadata and key wraps.
+          description: Account metadata, 7-day offline lease policy, and key wraps.
+        '401':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+
+  /v1/accounts/disable-sync:
+    post:
+      summary: Disable Cloud Sync & Revoke All Other Devices
+      description: >
+        Turns off cloud sync from the calling device, immediately purges all encrypted vault items,
+        history, attachments, wraps, and sync sessions on the server, and revokes all other devices
+        with `revoked_reason=sync_disabled` (`wipe_required=true`). Re-enabling sync later requires
+        registering a brand new sync account.
+      security:
+        - NPSSv1Auth: []
+      parameters:
+        - name: x-nexxpass-revocation-proof
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Optional 64-byte base64url Ed25519 signature over `NPSDisableSync1\n<account_id_b64u>`.
+      responses:
+        '200':
+          description: Sync disabled, vault purged, and all other devices revoked.
         '401':
           $ref: '#/components/responses/Error'
         '403':
@@ -254,6 +322,36 @@ paths:
       responses:
         '200':
           description: Device list.
+
+  /v1/devices/{device_id}:
+    delete:
+      summary: Revoke Device & Trigger Remote Wipe
+      description: >
+        Revokes the specified device, deletes its key wraps and sync sessions, emits `event: revoked`
+        (`wipe_required=true`) on its SSE stream, and causes any subsequent HTTP contact from that
+        device to return `403 device_revoked` with `wipe_required=true` and `x-nexxpass-wipe-vault: true`.
+      security:
+        - NPSSv1Auth: []
+      parameters:
+        - name: device_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: x-nexxpass-revocation-proof
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Optional 64-byte base64url Ed25519 signature over `NPSRevoke1\n<account_id_b64u>\n<target_device_id>`.
+      responses:
+        '200':
+          description: Device revoked.
+        '403':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
 
   /v1/pairings:
     post:
@@ -314,6 +412,84 @@ paths:
                     type: array
                     items:
                       $ref: '#/components/schemas/OperationResult'
+        '426':
+          description: Client update required because deletion proofs are mandatory.
+
+  /v1/sync/attachments/{record_id}/{attachment_id}:
+    parameters:
+      - name: record_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: attachment_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    put:
+      summary: Store Encrypted Attachment
+      description: >
+        Idempotently stores an end-to-end encrypted attachment envelope. Each
+        envelope is limited to 10 MiB plus framing; total attachment ciphertext
+        quota is 50 MiB per account. The request body may be up to 16 MiB to
+        accommodate base64url encoding.
+      security:
+        - NPSSv1Auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EncryptedAttachmentUpload'
+      responses:
+        '200':
+          description: Encrypted blob stored.
+        '413':
+          description: Encoded request or envelope exceeds the request-size limit.
+        '429':
+          description: Per-account encrypted attachment quota exceeded.
+    get:
+      summary: Fetch Encrypted Attachment
+      description: Returns ciphertext and key version for the requested record-scoped attachment.
+      security:
+        - NPSSv1Auth: []
+      responses:
+        '200':
+          description: Encrypted blob.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EncryptedAttachment'
+        '404':
+          $ref: '#/components/responses/Error'
+
+  /v1/sync/attachments/{record_id}/reconcile:
+    parameters:
+      - name: record_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      summary: Remove Unreferenced Attachment Blobs
+      description: Deletes blobs for this record that are not in the latest authenticated encrypted record's attachment list.
+      security:
+        - NPSSv1Auth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttachmentReconcileRequest'
+      responses:
+        '200':
+          description: Stale blobs removed.
+        '404':
+          $ref: '#/components/responses/Error'
 
   /v1/sync/pull:
     post:

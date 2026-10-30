@@ -1,10 +1,14 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use axum::{extract::State, Extension, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 
 use crate::{
-    auth::{AuthenticatedPrincipal, PrincipalKind},
+    auth::{
+        compute_offline_lease_token, AuthenticatedPrincipal, PrincipalKind, OFFLINE_LEASE_SECONDS,
+    },
     error::AppError,
     state::AppState,
 };
@@ -23,8 +27,20 @@ pub struct AccountMeResponse {
     rotation: RotationInfo,
     device: DeviceInfo,
     checkpoint: Checkpoint,
+    sync_policy: SyncPolicyInfo,
     wraps: Vec<KeyWrap>,
     events: Vec<AccountEvent>,
+}
+
+#[derive(Serialize)]
+struct SyncPolicyInfo {
+    server_time_unix: u64,
+    offline_lease_seconds: u64,
+    lease_expires_unix: u64,
+    lease_token: String,
+    pause_after_offline_days: u32,
+    wipe_on_revocation: bool,
+    re_enable_requires_new_account: bool,
 }
 
 #[derive(Serialize)]
@@ -182,6 +198,19 @@ pub async fn get_account_me(
         });
     }
 
+    let server_time_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Unavailable)?
+        .as_secs();
+    let lease_expires_unix = server_time_unix.saturating_add(OFFLINE_LEASE_SECONDS);
+    let lease_token = compute_offline_lease_token(
+        &state.token_hmac_key,
+        &principal.account_id,
+        &device_id,
+        server_time_unix,
+        lease_expires_unix,
+    )?;
+
     Ok(Json(AccountMeResponse {
         account_id: URL_SAFE_NO_PAD.encode(&principal.account_id),
         status,
@@ -204,6 +233,15 @@ pub async fn get_account_me(
             last_seen_seq,
             tombstone_floor_seq,
             change_floor_seq,
+        },
+        sync_policy: SyncPolicyInfo {
+            server_time_unix,
+            offline_lease_seconds: OFFLINE_LEASE_SECONDS,
+            lease_expires_unix,
+            lease_token,
+            pause_after_offline_days: 7,
+            wipe_on_revocation: true,
+            re_enable_requires_new_account: true,
         },
         wraps,
         events,

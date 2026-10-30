@@ -30,7 +30,10 @@ impl Default for Metrics {
 #[derive(Clone, Debug)]
 pub struct SyncNotification {
     pub account_id: Vec<u8>,
-    pub seq: i64,
+    pub seq: Option<i64>,
+    pub revoked_device_id: Option<uuid::Uuid>,
+    pub revoked_reason: Option<String>,
+    pub revocation_proof: Option<String>,
 }
 
 #[derive(Clone)]

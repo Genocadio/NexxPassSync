@@ -11,6 +11,7 @@ src/
   config.rs       Environment configuration and validation
   auth.rs         Raw-byte request signatures, principal lookup, replay guard
   account.rs      Authenticated account metadata response
+  attachment.rs   Account-scoped encrypted attachment blob storage
   error.rs        One structured API error boundary
   health.rs       Liveness and database readiness probes
   http.rs         Middleware, request IDs, and versioned route composition
@@ -47,6 +48,14 @@ lifecycle remain absent. Follow
 `../../nexxpass/docs/zero-knowledge-sync-server-plan.md`; its deployment target and
 remaining Phase 0 review gates are still open.
 
+Encrypted attachment objects use the device-authenticated
+`/v1/sync/attachments/{record_id}/{attachment_id}` routes and migration
+`0010_attachment_blobs.sql`. The server stores opaque ciphertext only, caps
+objects at 10 MiB plus framing and total ciphertext at 50 MiB per account, and
+removes stale objects when records are reconciled or deleted. Attachment
+requests have a 16 MiB encoded-body limit; other authenticated requests retain
+their 1 MiB body limit.
+
 ## Local development
 
 1. Start PostgreSQL and set `DATABASE_URL` (see `.env.example`).
@@ -56,3 +65,8 @@ remaining Phase 0 review gates are still open.
 Migrations currently run at startup for local development. Production rollout
 needs a separate migration release step and TLS at a trusted ingress; the
 service must not sit behind a proxy that rewrites signed request bytes or paths.
+
+The delete-proof migration and signed-delete enforcement require a coordinated
+client/server release. Older clients receive HTTP 426 for delete mutations and
+must be upgraded; do not roll out server enforcement while relying on older
+clients to sync deletions.

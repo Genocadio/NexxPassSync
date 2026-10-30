@@ -1,5 +1,6 @@
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     http::{
         header::{HeaderName, HeaderValue},
         Request, StatusCode,
@@ -29,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/accounts/lock", post(crate::device::lock_account))
         .route("/accounts/migrate", post(crate::device::migrate_identity))
+        .route("/accounts/disable-sync", post(crate::device::disable_sync))
         .route(
             "/accounts",
             axum::routing::delete(crate::device::delete_account),
@@ -56,6 +58,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sync/batch", post(crate::sync::handle_sync_batch))
         .route(
+            "/sync/attachments/{record_id}/{attachment_id}",
+            axum::routing::get(crate::attachment::get_attachment)
+                .put(crate::attachment::put_attachment),
+        )
+        .route(
+            "/sync/attachments/{record_id}/reconcile",
+            post(crate::attachment::reconcile_attachments),
+        )
+        .route(
             "/sync/events",
             axum::routing::get(crate::sync::handle_sync_events),
         )
@@ -77,14 +88,23 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::auth::authenticate_device,
+        ))
+        .layer(DefaultBodyLimit::max(
+            crate::attachment::MAX_ATTACHMENT_REQUEST_BYTES,
+        ))
+        .layer(RequestBodyLimitLayer::new(
+            crate::attachment::MAX_ATTACHMENT_REQUEST_BYTES,
         ));
-    let api_v1 = Router::new()
+    let public_routes = Router::new()
         .route("/accounts", post(crate::registration::register_account))
         .route("/pairings", post(crate::pairing::create_pairing_challenge))
         .route(
             "/pairings/relay/{device_id}",
             axum::routing::get(crate::pairing::get_pairing_relay),
         )
+        .layer(RequestBodyLimitLayer::new(1024 * 1024));
+    let api_v1 = Router::new()
+        .merge(public_routes)
         .merge(authenticated_routes);
     Router::new()
         .nest("/health", health::routes())
@@ -92,7 +112,6 @@ pub fn router(state: AppState) -> Router {
         .route("/metrics", axum::routing::get(health::metrics))
         .nest("/v1", api_v1)
         .fallback(|| async { StatusCode::NOT_FOUND })
-        .layer(RequestBodyLimitLayer::new(1024 * 1024))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         // Avoid TraceLayer's default header/body recording. Keep request logs
         // metadata-only; signed bytes and secrets must never be emitted.

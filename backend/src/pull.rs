@@ -142,11 +142,8 @@ pub fn decode_continuation_token(
 
     let mut hmac = HmacSha256::new_from_slice(key).map_err(|_| AppError::Unavailable)?;
     hmac.update(&mac_input);
-    let tag = hmac.finalize().into_bytes();
-
-    if raw[53..69] != tag[0..16] {
-        return Err(AppError::InvalidInput);
-    }
+    hmac.verify_truncated_left(&raw[53..69])
+        .map_err(|_| AppError::InvalidInput)?;
 
     let mut epoch_bytes = [0u8; 8];
     epoch_bytes.copy_from_slice(&raw[1..9]);
@@ -232,11 +229,8 @@ pub fn decode_page_receipt(
 
     let mut hmac = HmacSha256::new_from_slice(key).map_err(|_| AppError::Unavailable)?;
     hmac.update(&mac_input);
-    let tag = hmac.finalize().into_bytes();
-
-    if raw[29..45] != tag[0..16] {
-        return Err(AppError::InvalidInput);
-    }
+    hmac.verify_truncated_left(&raw[29..45])
+        .map_err(|_| AppError::InvalidInput)?;
 
     let session_id = Uuid::from_slice(&raw[1..17]).map_err(|_| AppError::InvalidInput)?;
 

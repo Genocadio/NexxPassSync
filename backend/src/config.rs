@@ -20,7 +20,7 @@ pub enum ConfigError {
     InvalidBindAddress,
     #[error("SYNC_DATABASE_MAX_CONNECTIONS must be a positive integer")]
     InvalidPoolSize,
-    #[error("SYNC_TOKEN_KEY_HEX must be a 64-character hex string")]
+    #[error("SYNC_TOKEN_KEY_HEX is required in production and must be a 64-character hex string")]
     InvalidTokenKey,
     #[error("SYNC_DEPLOYMENT_EPOCH must be a positive integer")]
     InvalidDeploymentEpoch,
@@ -43,16 +43,28 @@ impl Config {
             .filter(|count| *count > 0)
             .ok_or(ConfigError::InvalidPoolSize)?;
 
-        let token_hex =
-            env::var("SYNC_TOKEN_KEY_HEX").unwrap_or_else(|_| DEFAULT_TOKEN_KEY_HEX.to_owned());
-        if token_hex.len() != 64 {
-            return Err(ConfigError::InvalidTokenKey);
-        }
-        let mut token_hmac_key = [0u8; 32];
-        for i in 0..32 {
-            token_hmac_key[i] = u8::from_str_radix(&token_hex[i * 2..i * 2 + 2], 16)
-                .map_err(|_| ConfigError::InvalidTokenKey)?;
-        }
+        let is_production = env::var("SYNC_ENV")
+            .map(|v| v.eq_ignore_ascii_case("production") || v.eq_ignore_ascii_case("prod"))
+            .unwrap_or(false);
+
+        let token_hex = match env::var("SYNC_TOKEN_KEY_HEX") {
+            Ok(val) => {
+                if is_production && val.eq_ignore_ascii_case(DEFAULT_TOKEN_KEY_HEX) {
+                    return Err(ConfigError::InvalidTokenKey);
+                }
+                val
+            }
+            Err(_) => {
+                if is_production {
+                    return Err(ConfigError::InvalidTokenKey);
+                }
+                tracing::warn!(
+                    "SYNC_TOKEN_KEY_HEX is not set; using development fallback key. Set SYNC_TOKEN_KEY_HEX in production!"
+                );
+                DEFAULT_TOKEN_KEY_HEX.to_owned()
+            }
+        };
+        let token_hmac_key = parse_token_key_hex(&token_hex, is_production)?;
 
         let deployment_epoch = env::var("SYNC_DEPLOYMENT_EPOCH")
             .unwrap_or_else(|_| "1".to_owned())
@@ -74,5 +86,40 @@ impl Config {
             deployment_epoch,
             maintenance_interval_seconds,
         })
+    }
+}
+
+pub fn parse_token_key_hex(token_hex: &str, reject_trivial: bool) -> Result<[u8; 32], ConfigError> {
+    if token_hex.len() != 64 {
+        return Err(ConfigError::InvalidTokenKey);
+    }
+    let mut token_hmac_key = [0u8; 32];
+    for i in 0..32 {
+        token_hmac_key[i] = u8::from_str_radix(&token_hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| ConfigError::InvalidTokenKey)?;
+    }
+    if reject_trivial {
+        let first = token_hmac_key[0];
+        if token_hmac_key.iter().all(|&b| b == first) {
+            return Err(ConfigError::InvalidTokenKey);
+        }
+    }
+    Ok(token_hmac_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_token_key_hex_rejects_trivial_keys_in_prod() {
+        let valid = "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+        assert!(parse_token_key_hex(valid, true).is_ok());
+
+        let all_zeros = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(parse_token_key_hex(all_zeros, true).is_err());
+        assert!(parse_token_key_hex(all_zeros, false).is_ok());
+
+        assert!(parse_token_key_hex("short", false).is_err());
     }
 }

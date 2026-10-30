@@ -1,4 +1,9 @@
-use std::{collections::HashSet, convert::Infallible};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use axum::{
     extract::State,
@@ -6,11 +11,11 @@ use axum::{
     Extension, Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tokio_stream::{wrappers::BroadcastStream, Stream};
 use uuid::Uuid;
 
 use crate::{
@@ -24,6 +29,7 @@ pub(crate) const MIN_BLOB_BYTES: usize = 552;
 pub(crate) const MAX_BLOB_BYTES: usize = 65536;
 pub(crate) const MAX_LIVE_ITEMS: i64 = 25_000;
 pub(crate) const MAX_CIPHERTEXT_BYTES: i64 = 50 * 1024 * 1024;
+pub(crate) const MAX_HISTORY_CIPHERTEXT_BYTES: i64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -183,7 +189,7 @@ pub async fn handle_sync_batch(
                     return Err(AppError::InvalidInput);
                 }
                 let Some(proof) = &op.delete_proof else {
-                    return Err(AppError::InvalidInput);
+                    return Err(AppError::DeleteProofRequired);
                 };
                 let decoded_proof = URL_SAFE_NO_PAD
                     .decode(proof)
@@ -238,6 +244,9 @@ pub async fn handle_sync_batch(
     }
     if status == "deletion_pending" {
         return Err(AppError::AccountDeletionPending);
+    }
+    if status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
     }
 
     let identity_public_key: Vec<u8> = account_row.try_get("identity_ed25519_pub")?;
@@ -303,30 +312,97 @@ pub async fn handle_sync_batch(
 
     let mut results = Vec::with_capacity(validated_mutations.len());
 
-    for mutation in validated_mutations {
-        let op_row = sqlx::query(
-            "SELECT op_hash, status, item_version, seq \
-             FROM operations \
-             WHERE account_id = $1 AND operation_id = $2",
-        )
-        .bind(&account_id)
-        .bind(mutation.operation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let batch_op_ids: Vec<Uuid> = validated_mutations.iter().map(|m| m.operation_id).collect();
+    let batch_item_ids: Vec<Uuid> = validated_mutations.iter().map(|m| m.item_id).collect();
 
-        if let Some(existing_op) = op_row {
-            let stored_hash: Vec<u8> = existing_op.try_get("op_hash")?;
-            if stored_hash != mutation.op_hash {
+    let existing_op_rows = sqlx::query(
+        "SELECT operation_id, op_hash, item_version, seq \
+         FROM operations \
+         WHERE account_id = $1 AND operation_id = ANY($2)",
+    )
+    .bind(&account_id)
+    .bind(&batch_op_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    struct CachedOperationState {
+        op_hash: Vec<u8>,
+        item_version: Option<i64>,
+        seq: Option<i64>,
+    }
+
+    let mut existing_ops: HashMap<Uuid, CachedOperationState> =
+        HashMap::with_capacity(existing_op_rows.len());
+    for row in existing_op_rows {
+        let op_id: Uuid = row.try_get("operation_id")?;
+        let op_hash: Vec<u8> = row.try_get("op_hash")?;
+        let item_version: Option<i64> = row.try_get("item_version")?;
+        let seq: Option<i64> = row.try_get("seq")?;
+        existing_ops.insert(
+            op_id,
+            CachedOperationState {
+                op_hash,
+                item_version,
+                seq,
+            },
+        );
+    }
+
+    let retired_rows = sqlx::query(
+        "SELECT item_id FROM retired_item_ids WHERE account_id = $1 AND item_id = ANY($2)",
+    )
+    .bind(&account_id)
+    .bind(&batch_item_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut retired_items: HashSet<Uuid> = HashSet::with_capacity(retired_rows.len());
+    for row in retired_rows {
+        retired_items.insert(row.try_get("item_id")?);
+    }
+
+    let item_rows = sqlx::query(
+        "SELECT item_id, version, deleted, octet_length(blob) AS blob_len \
+         FROM items WHERE account_id = $1 AND item_id = ANY($2)",
+    )
+    .bind(&account_id)
+    .bind(&batch_item_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    struct CachedItemState {
+        version: i64,
+        deleted: bool,
+        blob_len: i64,
+    }
+
+    let mut current_items: HashMap<Uuid, CachedItemState> = HashMap::with_capacity(item_rows.len());
+    for row in item_rows {
+        let item_id: Uuid = row.try_get("item_id")?;
+        let version: i64 = row.try_get("version")?;
+        let deleted: bool = row.try_get("deleted")?;
+        let blob_len = row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64;
+        current_items.insert(
+            item_id,
+            CachedItemState {
+                version,
+                deleted,
+                blob_len,
+            },
+        );
+    }
+
+    for mutation in validated_mutations {
+        if let Some(existing_op) = existing_ops.get(&mutation.operation_id) {
+            if existing_op.op_hash.as_slice() != mutation.op_hash {
                 // Different hash for same operation_id rejects the batch as a whole with 422.
                 return Err(AppError::OperationIdReused);
             }
-            let item_version: Option<i64> = existing_op.try_get("item_version")?;
-            let seq: Option<i64> = existing_op.try_get("seq")?;
             results.push(OperationResult {
                 operation_id: mutation.operation_id.to_string(),
                 status: "duplicate".to_string(),
-                version: item_version.map(|v| v as u64),
-                seq: seq.map(|s| s as u64),
+                version: existing_op.item_version.map(|v| v as u64),
+                seq: existing_op.seq.map(|s| s as u64),
             });
             continue;
         }
@@ -353,14 +429,7 @@ pub async fn handle_sync_batch(
         }
 
         // Check permanent retirement marker.
-        let retired =
-            sqlx::query("SELECT 1 FROM retired_item_ids WHERE account_id = $1 AND item_id = $2")
-                .bind(&account_id)
-                .bind(mutation.item_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        if retired.is_some() {
+        if retired_items.contains(&mutation.item_id) {
             results.push(OperationResult {
                 operation_id: mutation.operation_id.to_string(),
                 status: "item_deleted".to_string(),
@@ -371,14 +440,7 @@ pub async fn handle_sync_batch(
         }
 
         // Lookup current item state.
-        let current_item = sqlx::query(
-            "SELECT version, seq, deleted, octet_length(blob) AS blob_len \
-             FROM items WHERE account_id = $1 AND item_id = $2",
-        )
-        .bind(&account_id)
-        .bind(mutation.item_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let current_item = current_items.get(&mutation.item_id);
 
         match mutation.op {
             ParsedOp::Put {
@@ -386,19 +448,18 @@ pub async fn handle_sync_batch(
                 decoded_blob,
                 ..
             } => {
-                let old_blob_len: i64 = match &current_item {
+                let old_blob_len: i64 = match current_item {
                     Some(row) => {
-                        let is_del: bool = row.try_get("deleted")?;
-                        if is_del {
+                        if row.deleted {
                             0
                         } else {
-                            row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64
+                            row.blob_len
                         }
                     }
                     None => 0,
                 };
-                let is_new_item = match &current_item {
-                    Some(row) => row.try_get::<bool, _>("deleted")?,
+                let is_new_item = match current_item {
+                    Some(row) => row.deleted,
                     None => true,
                 };
                 if is_new_item && current_live_items + 1 > MAX_LIVE_ITEMS {
@@ -415,8 +476,7 @@ pub async fn handle_sync_batch(
                 current_ciphertext_bytes += net_diff;
 
                 let next_version = if let Some(item_row) = current_item {
-                    let is_deleted: bool = item_row.try_get("deleted")?;
-                    if is_deleted {
+                    if item_row.deleted {
                         results.push(OperationResult {
                             operation_id: mutation.operation_id.to_string(),
                             status: "item_deleted".to_string(),
@@ -425,8 +485,7 @@ pub async fn handle_sync_batch(
                         });
                         continue;
                     }
-                    let current_version: i64 = item_row.try_get("version")?;
-                    if current_version as u64 != mutation.base_version {
+                    if item_row.version as u64 != mutation.base_version {
                         results.push(OperationResult {
                             operation_id: mutation.operation_id.to_string(),
                             status: "base_version_conflict".to_string(),
@@ -435,7 +494,7 @@ pub async fn handle_sync_batch(
                         });
                         continue;
                     }
-                    (current_version + 1) as u64
+                    (item_row.version + 1) as u64
                 } else {
                     if mutation.base_version > 0 {
                         results.push(OperationResult {
@@ -519,8 +578,7 @@ pub async fn handle_sync_batch(
                     continue;
                 };
 
-                let is_deleted: bool = item_row.try_get("deleted")?;
-                if is_deleted {
+                if item_row.deleted {
                     results.push(OperationResult {
                         operation_id: mutation.operation_id.to_string(),
                         status: "item_deleted".to_string(),
@@ -530,8 +588,7 @@ pub async fn handle_sync_batch(
                     continue;
                 }
 
-                let current_version: i64 = item_row.try_get("version")?;
-                if current_version as u64 != mutation.base_version {
+                if item_row.version as u64 != mutation.base_version {
                     results.push(OperationResult {
                         operation_id: mutation.operation_id.to_string(),
                         status: "base_version_conflict".to_string(),
@@ -541,12 +598,11 @@ pub async fn handle_sync_batch(
                     continue;
                 }
 
-                let old_blob_len: i64 =
-                    item_row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64;
+                let old_blob_len = item_row.blob_len;
                 current_live_items = current_live_items.saturating_sub(1);
                 current_ciphertext_bytes = current_ciphertext_bytes.saturating_sub(old_blob_len);
 
-                let next_version = (current_version + 1) as u64;
+                let next_version = (item_row.version + 1) as u64;
                 seq_counter += 1;
 
                 sqlx::query(
@@ -583,6 +639,14 @@ pub async fn handle_sync_batch(
                 .await?;
 
                 sqlx::query(
+                    "DELETE FROM attachment_blobs WHERE account_id = $1 AND record_id = $2",
+                )
+                .bind(&account_id)
+                .bind(mutation.item_id)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
                     "INSERT INTO operations (account_id, operation_id, op_hash, status, item_version, seq, created_at) \
                      VALUES ($1, $2, $3, 'applied', $4, $5, now())",
                 )
@@ -610,6 +674,63 @@ pub async fn handle_sync_batch(
             .bind(seq_counter)
             .execute(&mut *tx)
             .await?;
+
+        // Enforce the 100 MB (2x live quota) historical ciphertext cap on item_changes (Plan §8).
+        let history_bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(octet_length(blob)), 0)::bigint \
+             FROM item_changes WHERE account_id = $1",
+        )
+        .bind(&account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if history_bytes > MAX_HISTORY_CIPHERTEXT_BYTES {
+            let active_sessions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sync_sessions \
+                 WHERE account_id = $1 AND expires_at > now()",
+            )
+            .bind(&account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+            if active_sessions == 0 {
+                let pruned_seqs: Vec<i64> = sqlx::query_scalar(
+                    "DELETE FROM item_changes ic \
+                     USING items i \
+                     WHERE ic.account_id = $1 \
+                       AND i.account_id = ic.account_id \
+                       AND i.item_id = ic.item_id \
+                       AND ic.seq < i.seq \
+                     RETURNING ic.seq",
+                )
+                .bind(&account_id)
+                .fetch_all(&mut *tx)
+                .await?;
+
+                if let Some(max_pruned_seq) = pruned_seqs.into_iter().max() {
+                    sqlx::query(
+                        "UPDATE accounts \
+                         SET change_floor_seq = GREATEST(change_floor_seq, $2) \
+                         WHERE account_id = $1",
+                    )
+                    .bind(&account_id)
+                    .bind(max_pruned_seq)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    let event_id = Uuid::now_v7();
+                    sqlx::query(
+                        "INSERT INTO account_events (account_id, event_id, event_type, actor, actor_device_id) \
+                         VALUES ($1, $2, 'history_cap_prune', 'device', $3)",
+                    )
+                    .bind(&account_id)
+                    .bind(event_id)
+                    .bind(device_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
     }
 
     tx.commit().await?;
@@ -617,16 +738,82 @@ pub async fn handle_sync_batch(
     if seq_counter != initial_seq_counter {
         let _ = state.sync_notifier.send(crate::state::SyncNotification {
             account_id: account_id.clone(),
-            seq: seq_counter,
+            seq: Some(seq_counter),
+            revoked_device_id: None,
+            revoked_reason: None,
+            revocation_proof: None,
         });
     }
 
     Ok(Json(BatchResponse { results }))
 }
 
+struct SseDropGuard(std::sync::Arc<crate::state::Metrics>);
+impl Drop for SseDropGuard {
+    fn drop(&mut self) {
+        self.0
+            .active_sse_connections
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct SyncEventStream {
+    inner: BroadcastStream<crate::state::SyncNotification>,
+    target_account_id: Vec<u8>,
+    caller_device_id: Uuid,
+    terminated: bool,
+    _guard: SseDropGuard,
+}
+
+impl Stream for SyncEventStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.terminated {
+            return Poll::Ready(None);
+        }
+        loop {
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(notification)))
+                    if notification.account_id == self.target_account_id =>
+                {
+                    if notification.revoked_device_id == Some(self.caller_device_id) {
+                        self.terminated = true;
+                        let data = serde_json::json!({
+                            "device_id": self.caller_device_id.to_string(),
+                            "wipe_required": true,
+                            "reason": notification.revoked_reason.unwrap_or_else(|| "user_revocation".to_string()),
+                            "revocation_proof": notification.revocation_proof,
+                        });
+                        return Poll::Ready(Some(Ok(Event::default()
+                            .event("revoked")
+                            .data(data.to_string()))));
+                    }
+                    if let Some(seq) = notification.seq {
+                        let data = serde_json::json!({
+                            "seq": seq,
+                        });
+                        return Poll::Ready(Some(Ok(Event::default()
+                            .event("sync")
+                            .data(data.to_string()))));
+                    }
+                }
+                Poll::Ready(Some(_)) => continue,
+                Poll::Ready(None) => {
+                    self.terminated = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
 /// GET /v1/sync/events
 /// Real-time Server-Sent Events (SSE) notification stream.
-/// Emits sequence updates `{"seq": N}` whenever changes are committed to the account.
+/// Emits sequence updates `{"seq": N}` whenever changes are committed to the account,
+/// and emits a final `event: revoked` with `"wipe_required": true` before closing
+/// if the connected device is revoked or sync is disabled.
 pub async fn handle_sync_events(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -653,30 +840,16 @@ pub async fn handle_sync_events(
         .metrics
         .active_sse_connections
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let metrics_clone = state.metrics.clone();
-    struct SseDropGuard(std::sync::Arc<crate::state::Metrics>);
-    impl Drop for SseDropGuard {
-        fn drop(&mut self) {
-            self.0
-                .active_sse_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    let guard = std::sync::Arc::new(SseDropGuard(metrics_clone));
+    let guard = SseDropGuard(state.metrics.clone());
 
     let rx = state.sync_notifier.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| {
-        let _ = &guard;
-        match item {
-            Ok(notification) if notification.account_id == target_account_id => {
-                let data = serde_json::json!({
-                    "seq": notification.seq,
-                });
-                Some(Ok(Event::default().event("sync").data(data.to_string())))
-            }
-            _ => None,
-        }
-    });
+    let stream = SyncEventStream {
+        inner: BroadcastStream::new(rx),
+        target_account_id,
+        caller_device_id,
+        terminated: false,
+        _guard: guard,
+    };
 
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -724,7 +897,7 @@ fn verify_delete_proof(
     let signature = Signature::from_slice(proof).map_err(|_| AppError::InvalidSignature)?;
     let version = base_version.checked_add(1).ok_or(AppError::InvalidInput)?;
     identity_key
-        .verify(
+        .verify_strict(
             &delete_proof_message(account_id, item_id, base_version, version),
             &signature,
         )
@@ -740,7 +913,7 @@ mod tests {
     fn delete_proofs_are_bound_to_account_item_and_version() {
         let key = SigningKey::from_bytes(&[0x42; 32]);
         let account_id = [0x24; 32];
-        let item_id = Uuid::parse_str("c4b0d7b4-9c27-4ed8-9d8b-22499e436a20").unwrap();
+        let item_id = Uuid::from_u128(0xc4b0_d7b4_9c27_4ed8_9d8b_2249_9e43_6a20);
         let message = delete_proof_message(&account_id, &item_id, 4, 5);
         let signature = key.sign(&message);
         let verifying_key = key.verifying_key();

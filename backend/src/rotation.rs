@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::{extract::State, Extension, Json};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     account::{rotation_info, RotationInfo},
-    auth::{decode_exact, AuthenticatedPrincipal, PrincipalKind},
+    auth::{decode_exact, lock_active_device_for_mutation, AuthenticatedPrincipal, PrincipalKind},
     error::AppError,
     state::AppState,
     sync::{
@@ -99,6 +99,9 @@ pub async fn start_rotation(
     }
     if status == "suspended" {
         return Err(AppError::AccountSuspended);
+    }
+    if status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
     }
     if status == "identity_locked" {
         return Err(AppError::IdentityLocked);
@@ -235,6 +238,7 @@ pub async fn heartbeat_rotation(
     let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT rotation_mode, rotation_owner_device_id, \
@@ -286,6 +290,7 @@ pub async fn resume_rotation(
     let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT rotation_mode, rotation_owner_device_id, \
@@ -345,6 +350,7 @@ pub async fn ack_rotation(
     let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT rotation_mode, rotation_target_key_version, active_key_version \
@@ -405,6 +411,19 @@ pub async fn ack_rotation(
     .execute(&mut *tx)
     .await?;
 
+    // If the rotation already completed (idle mode) and this device just caught up,
+    // prune any superseded device wraps held for this device.
+    if rotation_mode == "idle" {
+        sqlx::query(
+            "DELETE FROM key_wraps WHERE account_id = $1 AND recipient = $2 AND key_version < $3",
+        )
+        .bind(&principal.account_id)
+        .bind(caller_device_id.to_string())
+        .bind(request.key_version)
+        .execute(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
 
     let info = rotation_info(&state.database, &principal.account_id).await?;
@@ -422,6 +441,7 @@ pub async fn complete_rotation(
     let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT rotation_mode, rotation_target_key_version \
@@ -498,12 +518,37 @@ pub async fn complete_rotation(
     .execute(&mut *tx)
     .await?;
 
-    // Activate pending wraps, delete old wraps.
-    sqlx::query("DELETE FROM key_wraps WHERE account_id = $1 AND key_version < $2")
+    // Activate pending wraps and delete superseded wraps.
+    // In master_password_change mode, retain old device wraps ONLY for active devices
+    // that have not yet acknowledged target_key_version (Plan §11).
+    if rotation_mode == "master_password_change" {
+        sqlx::query(
+            "DELETE FROM key_wraps kw \
+             WHERE kw.account_id = $1 \
+               AND kw.key_version < $2 \
+               AND ( \
+                   kw.recipient = 'recovery' \
+                   OR NOT EXISTS ( \
+                       SELECT 1 FROM rotation_participants rp \
+                       WHERE rp.account_id = kw.account_id \
+                         AND rp.key_version = $2 \
+                         AND rp.device_id::text = kw.recipient \
+                         AND rp.revoked_at IS NULL \
+                         AND rp.key_acknowledged_at IS NULL \
+                   ) \
+               )",
+        )
         .bind(&principal.account_id)
         .bind(target_key_version)
         .execute(&mut *tx)
         .await?;
+    } else {
+        sqlx::query("DELETE FROM key_wraps WHERE account_id = $1 AND key_version < $2")
+            .bind(&principal.account_id)
+            .bind(target_key_version)
+            .execute(&mut *tx)
+            .await?;
+    }
 
     sqlx::query(
         "UPDATE key_wraps SET status = 'active' WHERE account_id = $1 AND key_version = $2",
@@ -513,11 +558,37 @@ pub async fn complete_rotation(
     .execute(&mut *tx)
     .await?;
 
-    // Clear rotation state, set active key version, increment keyring_version.
+    // Prune superseded item_changes rows encrypted under older key versions (< target_key_version)
+    // if no active sync_sessions pin them, and advance change_floor_seq (Plan §8 & §11).
+    let active_sessions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sync_sessions \
+         WHERE account_id = $1 AND expires_at > now()",
+    )
+    .bind(&principal.account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let max_pruned_seq: i64 = if active_sessions == 0 {
+        let pruned_seqs: Vec<i64> = sqlx::query_scalar(
+            "DELETE FROM item_changes \
+             WHERE account_id = $1 AND deleted = FALSE AND key_version < $2 \
+             RETURNING seq",
+        )
+        .bind(&principal.account_id)
+        .bind(target_key_version)
+        .fetch_all(&mut *tx)
+        .await?;
+        pruned_seqs.into_iter().max().unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Clear rotation state, set active key version, increment keyring_version, and advance change_floor_seq.
     sqlx::query(
         "UPDATE accounts SET \
              active_key_version = $2, \
              keyring_version = keyring_version + 1, \
+             change_floor_seq = GREATEST(change_floor_seq, $3), \
              rotation_mode = 'idle', \
              rotation_target_key_version = NULL, \
              rotation_owner_device_id = NULL, \
@@ -528,6 +599,7 @@ pub async fn complete_rotation(
     )
     .bind(&principal.account_id)
     .bind(target_key_version)
+    .bind(max_pruned_seq)
     .execute(&mut *tx)
     .await?;
 
@@ -559,6 +631,7 @@ pub async fn abort_rotation(
     let caller_device_id = principal.device_id.ok_or(AppError::InvalidSignature)?;
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT rotation_mode, rotation_target_key_version \
@@ -747,6 +820,7 @@ pub async fn rewrite_rotation(
     }
 
     let mut tx = state.database.begin().await?;
+    lock_active_device_for_mutation(&mut tx, &principal).await?;
 
     let account_row = sqlx::query(
         "SELECT rotation_mode, rotation_target_key_version, rotation_owner_device_id, \
@@ -798,40 +872,100 @@ pub async fn rewrite_rotation(
 
     let mut results = Vec::with_capacity(validated_mutations.len());
 
-    for mutation in validated_mutations {
-        let existing_op = sqlx::query(
-            "SELECT op_hash, status, item_version, seq \
-             FROM operations WHERE account_id = $1 AND operation_id = $2",
-        )
-        .bind(&account_id)
-        .bind(mutation.operation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let batch_op_ids: Vec<Uuid> = validated_mutations.iter().map(|m| m.operation_id).collect();
+    let batch_item_ids: Vec<Uuid> = validated_mutations.iter().map(|m| m.item_id).collect();
 
-        if let Some(existing_row) = existing_op {
-            let existing_hash: Vec<u8> = existing_row.try_get("op_hash")?;
-            if existing_hash != mutation.op_hash {
+    let existing_op_rows = sqlx::query(
+        "SELECT operation_id, op_hash, item_version, seq \
+         FROM operations WHERE account_id = $1 AND operation_id = ANY($2)",
+    )
+    .bind(&account_id)
+    .bind(&batch_op_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    struct CachedOperationState {
+        op_hash: Vec<u8>,
+        item_version: Option<i64>,
+        seq: Option<i64>,
+    }
+
+    let mut existing_ops: HashMap<Uuid, CachedOperationState> =
+        HashMap::with_capacity(existing_op_rows.len());
+    for row in existing_op_rows {
+        let op_id: Uuid = row.try_get("operation_id")?;
+        let op_hash: Vec<u8> = row.try_get("op_hash")?;
+        let item_version: Option<i64> = row.try_get("item_version")?;
+        let seq: Option<i64> = row.try_get("seq")?;
+        existing_ops.insert(
+            op_id,
+            CachedOperationState {
+                op_hash,
+                item_version,
+                seq,
+            },
+        );
+    }
+
+    let retired_rows = sqlx::query(
+        "SELECT item_id FROM retired_item_ids WHERE account_id = $1 AND item_id = ANY($2)",
+    )
+    .bind(&account_id)
+    .bind(&batch_item_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut retired_items: HashSet<Uuid> = HashSet::with_capacity(retired_rows.len());
+    for row in retired_rows {
+        retired_items.insert(row.try_get("item_id")?);
+    }
+
+    let item_rows = sqlx::query(
+        "SELECT item_id, version, deleted, octet_length(blob) AS blob_len \
+         FROM items WHERE account_id = $1 AND item_id = ANY($2)",
+    )
+    .bind(&account_id)
+    .bind(&batch_item_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    struct CachedItemState {
+        version: i64,
+        deleted: bool,
+        blob_len: i64,
+    }
+
+    let mut current_items: HashMap<Uuid, CachedItemState> = HashMap::with_capacity(item_rows.len());
+    for row in item_rows {
+        let item_id: Uuid = row.try_get("item_id")?;
+        let version: i64 = row.try_get("version")?;
+        let deleted: bool = row.try_get("deleted")?;
+        let blob_len = row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64;
+        current_items.insert(
+            item_id,
+            CachedItemState {
+                version,
+                deleted,
+                blob_len,
+            },
+        );
+    }
+
+    for mutation in validated_mutations {
+        if let Some(existing_op) = existing_ops.get(&mutation.operation_id) {
+            if existing_op.op_hash.as_slice() != mutation.op_hash {
                 return Err(AppError::OperationIdReused);
             }
-            let item_version: Option<i64> = existing_row.try_get("item_version")?;
-            let seq: Option<i64> = existing_row.try_get("seq")?;
             results.push(OperationResult {
                 operation_id: mutation.operation_id.to_string(),
                 status: "duplicate".to_string(),
-                version: item_version.map(|v| v as u64),
-                seq: seq.map(|s| s as u64),
+                version: existing_op.item_version.map(|v| v as u64),
+                seq: existing_op.seq.map(|s| s as u64),
             });
             continue;
         }
 
-        let retired =
-            sqlx::query("SELECT 1 FROM retired_item_ids WHERE account_id = $1 AND item_id = $2")
-                .bind(&account_id)
-                .bind(mutation.item_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        if retired.is_some() {
+        if retired_items.contains(&mutation.item_id) {
             results.push(OperationResult {
                 operation_id: mutation.operation_id.to_string(),
                 status: "item_deleted".to_string(),
@@ -841,14 +975,7 @@ pub async fn rewrite_rotation(
             continue;
         }
 
-        let current_item = sqlx::query(
-            "SELECT version, seq, deleted, octet_length(blob) AS blob_len \
-             FROM items WHERE account_id = $1 AND item_id = $2",
-        )
-        .bind(&account_id)
-        .bind(mutation.item_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let current_item = current_items.get(&mutation.item_id);
 
         if let ParsedOp::Put {
             key_version,
@@ -856,13 +983,12 @@ pub async fn rewrite_rotation(
             ..
         } = mutation.op
         {
-            let old_blob_len: i64 = match &current_item {
+            let old_blob_len: i64 = match current_item {
                 Some(row) => {
-                    let is_del: bool = row.try_get("deleted")?;
-                    if is_del {
+                    if row.deleted {
                         0
                     } else {
-                        row.try_get::<Option<i32>, _>("blob_len")?.unwrap_or(0) as i64
+                        row.blob_len
                     }
                 }
                 None => 0,
@@ -875,8 +1001,7 @@ pub async fn rewrite_rotation(
             current_ciphertext_bytes += net_diff;
 
             let next_version = if let Some(item_row) = current_item {
-                let is_deleted: bool = item_row.try_get("deleted")?;
-                if is_deleted {
+                if item_row.deleted {
                     results.push(OperationResult {
                         operation_id: mutation.operation_id.to_string(),
                         status: "item_deleted".to_string(),
@@ -885,8 +1010,7 @@ pub async fn rewrite_rotation(
                     });
                     continue;
                 }
-                let current_version: i64 = item_row.try_get("version")?;
-                if current_version as u64 != mutation.base_version {
+                if item_row.version as u64 != mutation.base_version {
                     results.push(OperationResult {
                         operation_id: mutation.operation_id.to_string(),
                         status: "base_version_conflict".to_string(),
@@ -895,7 +1019,7 @@ pub async fn rewrite_rotation(
                     });
                     continue;
                 }
-                (current_version + 1) as u64
+                (item_row.version + 1) as u64
             } else {
                 if mutation.base_version > 0 {
                     results.push(OperationResult {
@@ -974,6 +1098,16 @@ pub async fn rewrite_rotation(
     }
 
     tx.commit().await?;
+
+    if seq_counter > initial_seq_counter {
+        let _ = state.sync_notifier.send(crate::state::SyncNotification {
+            account_id,
+            seq: Some(seq_counter),
+            revoked_device_id: None,
+            revoked_reason: None,
+            revocation_proof: None,
+        });
+    }
 
     Ok(Json(BatchResponse { results }))
 }

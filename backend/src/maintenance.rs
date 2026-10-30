@@ -19,10 +19,16 @@ pub async fn run_maintenance(pool: &PgPool) -> Result<Option<MaintenanceStats>, 
 
     let stats_res = execute_maintenance(pool).await;
 
-    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
         .bind(MAINTENANCE_ADVISORY_LOCK_ID)
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await;
+
+    if !matches!(unlocked, Ok(true)) {
+        // Evict the connection from the pool if session-level advisory unlock failed
+        // so that no pooled connection ever retains a leaked advisory lock.
+        let _ = conn.close().await;
+    }
 
     stats_res.map(Some)
 }
@@ -33,7 +39,8 @@ async fn execute_maintenance(pool: &PgPool) -> Result<MaintenanceStats, sqlx::Er
         deadlines_enforced: enforce_rotation_deadlines(pool).await?,
         unsynced_revoked: revoke_never_synced_devices(pool).await?,
         inactive_revoked: revoke_inactive_devices(pool).await?,
-        tombstones_pruned: prune_tombstones(pool).await?,
+        tombstones_pruned: prune_tombstones(pool).await?
+            + prune_superseded_item_changes(pool).await?,
         accounts_purged: purge_deleted_accounts(pool).await?,
     })
 }
@@ -48,8 +55,9 @@ pub struct MaintenanceStats {
     pub accounts_purged: u64,
 }
 
-/// Purges expired nonces, expired pairing challenges, expired sync sessions,
-/// operations older than 30 days, and account events older than 90 days.
+/// Purges expired nonces, expired pairing challenges, expired pairing relays,
+/// expired sync sessions, operations older than 30 days, and account events
+/// older than 90 days or exceeding 500 events per account.
 pub async fn cleanup_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let mut total = 0;
 
@@ -62,6 +70,11 @@ pub async fn cleanup_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> 
         sqlx::query("DELETE FROM pairing_challenges WHERE expires_at < now() - interval '1 hour'")
             .execute(pool)
             .await?;
+    total += res.rows_affected();
+
+    let res = sqlx::query("DELETE FROM pairing_relays WHERE expires_at <= now()")
+        .execute(pool)
+        .await?;
     total += res.rows_affected();
 
     let res = sqlx::query("DELETE FROM sync_sessions WHERE expires_at <= now()")
@@ -78,6 +91,24 @@ pub async fn cleanup_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> 
         sqlx::query("DELETE FROM account_events WHERE created_at < now() - interval '90 days'")
             .execute(pool)
             .await?;
+    total += res.rows_affected();
+
+    // Enforce the 500-event per-account cap on account_events (Plan §4 & §13.1).
+    let res = sqlx::query(
+        "DELETE FROM account_events ae \
+         USING ( \
+             SELECT account_id, event_id \
+             FROM ( \
+                 SELECT account_id, event_id, \
+                        ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY created_at DESC, event_id DESC) AS rn \
+                 FROM account_events \
+             ) ranked \
+             WHERE ranked.rn > 500 \
+         ) excess \
+         WHERE ae.account_id = excess.account_id AND ae.event_id = excess.event_id",
+    )
+    .execute(pool)
+    .await?;
     total += res.rows_affected();
 
     Ok(total)
@@ -338,9 +369,12 @@ pub async fn revoke_never_synced_devices(pool: &PgPool) -> Result<u64, sqlx::Err
 
 /// Revokes inactive devices after 180 days, except the account's last active device.
 pub async fn revoke_inactive_devices(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let accounts = sqlx::query("SELECT account_id FROM accounts")
-        .fetch_all(pool)
-        .await?;
+    let accounts = sqlx::query(
+        "SELECT DISTINCT account_id FROM devices \
+         WHERE revoked_at IS NULL AND last_seen_at < now() - interval '180 days'",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut revoked_count = 0;
     for acct_row in accounts {
@@ -436,9 +470,12 @@ pub async fn revoke_inactive_devices(pool: &PgPool) -> Result<u64, sqlx::Error> 
 /// Prunes tombstones older than 90 days and <= min active device checkpoint.
 /// Advances `tombstone_floor_seq` to the max purged tombstone sequence.
 pub async fn prune_tombstones(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let accounts = sqlx::query("SELECT account_id FROM accounts")
-        .fetch_all(pool)
-        .await?;
+    let accounts = sqlx::query(
+        "SELECT DISTINCT account_id FROM items \
+         WHERE deleted = TRUE AND updated_at < now() - interval '90 days'",
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut total_purged = 0;
     for acct_row in accounts {
@@ -503,13 +540,97 @@ pub async fn prune_tombstones(pool: &PgPool) -> Result<u64, sqlx::Error> {
     Ok(total_purged)
 }
 
-/// Hard-purges accounts whose 30-day deletion grace period has ended.
+/// Prunes superseded `item_changes` rows (`ic.seq < i.seq` and `ic.seq <= min_cp`)
+/// when all active devices have checkpointed past them and no active `sync_sessions`
+/// exist for the account, advancing `accounts.change_floor_seq` (Plan §8).
+pub async fn prune_superseded_item_changes(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let accounts = sqlx::query(
+        "SELECT DISTINCT ic.account_id \
+         FROM item_changes ic \
+         JOIN items i ON i.account_id = ic.account_id AND i.item_id = ic.item_id \
+         WHERE ic.seq < i.seq",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut total_pruned = 0;
+    for acct_row in accounts {
+        let account_id: Vec<u8> = acct_row.try_get("account_id")?;
+        let mut tx = pool.begin().await?;
+
+        let _ = sqlx::query("SELECT 1 FROM accounts WHERE account_id = $1 FOR UPDATE")
+            .bind(&account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        let active_sessions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sync_sessions WHERE account_id = $1 AND expires_at > now()",
+        )
+        .bind(&account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_sessions > 0 {
+            continue;
+        }
+
+        let min_checkpoint_row = sqlx::query(
+            "SELECT MIN(last_seen_seq) AS min_cp, COUNT(*) AS active_count \
+             FROM devices WHERE account_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(&account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let active_count: i64 = min_checkpoint_row.try_get("active_count")?;
+        if active_count == 0 {
+            continue;
+        }
+        let Some(min_cp): Option<i64> = min_checkpoint_row.try_get("min_cp")? else {
+            continue;
+        };
+
+        let pruned_seqs: Vec<i64> = sqlx::query_scalar(
+            "DELETE FROM item_changes ic \
+             USING items i \
+             WHERE ic.account_id = $1 \
+               AND i.account_id = ic.account_id \
+               AND i.item_id = ic.item_id \
+               AND ic.seq < i.seq \
+               AND ic.seq <= $2 \
+             RETURNING ic.seq",
+        )
+        .bind(&account_id)
+        .bind(min_cp)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if let Some(max_pruned_seq) = pruned_seqs.into_iter().max() {
+            sqlx::query(
+                "UPDATE accounts \
+                 SET change_floor_seq = GREATEST(change_floor_seq, $2) \
+                 WHERE account_id = $1",
+            )
+            .bind(&account_id)
+            .bind(max_pruned_seq)
+            .execute(&mut *tx)
+            .await?;
+            total_pruned += 1;
+        }
+
+        tx.commit().await?;
+    }
+
+    Ok(total_pruned)
+}
+
+/// Hard-purges accounts whose 30-day deletion grace period or 30-day sync-disabled
+/// revocation window has ended.
 /// Writes account_id into `deleted_accounts` permanently, and deletes the account.
 pub async fn purge_deleted_accounts(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let pending_accounts = sqlx::query(
         "SELECT account_id FROM accounts \
-         WHERE status = 'deletion_pending' \
-           AND deletion_requested_at < now() - interval '30 days'",
+         WHERE (status = 'deletion_pending' AND deletion_requested_at < now() - interval '30 days') \
+            OR (status = 'sync_disabled' AND sync_disabled_at < now() - interval '30 days')",
     )
     .fetch_all(pool)
     .await?;

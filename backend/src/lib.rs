@@ -1,4 +1,5 @@
 pub mod account;
+pub mod attachment;
 pub mod auth;
 pub mod config;
 pub mod device;

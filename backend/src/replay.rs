@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const MAX_GENERATION_ENTRIES: usize = 250_000;
+
 /// High-throughput in-memory replay filter with sliding two-generation rotation.
 /// Retains nonces across two 300-second windows (up to 600 seconds total),
 /// providing instantaneous O(1) in-memory rejection of replayed nonces.
@@ -55,7 +57,10 @@ impl ReplayFilter {
             return false;
         }
 
-        guard.current.insert(key);
+        // Bound in-memory cache size; overflow still falls back to PostgreSQL `request_nonces`
+        if guard.current.len() < MAX_GENERATION_ENTRIES {
+            guard.current.insert(key);
+        }
         true
     }
 }

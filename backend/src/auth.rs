@@ -3,21 +3,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::{
     body::{to_bytes, Body},
     extract::OriginalUri,
-    http::{HeaderMap, Request},
+    http::{
+        header::{HeaderName, HeaderValue},
+        HeaderMap, Request,
+    },
     middleware::Next,
     response::Response,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signature, VerifyingKey};
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{error::AppError, state::AppState};
 
+type HmacSha256 = Hmac<Sha256>;
+
 const BODY_LIMIT: usize = 1024 * 1024;
 const NONCE_TTL_HOURS: i64 = 48;
 const TIMESTAMP_WINDOW_SECONDS: u64 = 300;
+/// 7-day offline lease window for sync-enabled devices (604,800 seconds).
+/// Clients with sync enabled must contact the server within this window or pause
+/// local vault access until they reconnect and verify device status.
+pub const OFFLINE_LEASE_SECONDS: u64 = 7 * 24 * 3600;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrincipalKind {
@@ -38,15 +48,20 @@ pub async fn authenticate_device(
     next: Next,
 ) -> Result<Response, AppError> {
     let (mut parts, body) = request.into_parts();
-    let body = to_bytes(body, BODY_LIMIT)
-        .await
-        .map_err(|_| AppError::RequestTooLarge)?;
-    let headers = parts.headers.clone();
     let original_uri = parts
         .extensions
         .get::<OriginalUri>()
         .map(|uri| uri.0.clone())
         .unwrap_or_else(|| parts.uri.clone());
+    let body_limit = if original_uri.path().starts_with("/v1/sync/attachments/") {
+        crate::attachment::MAX_ATTACHMENT_REQUEST_BYTES
+    } else {
+        BODY_LIMIT
+    };
+    let body = to_bytes(body, body_limit)
+        .await
+        .map_err(|_| AppError::RequestTooLarge)?;
+    let headers = parts.headers.clone();
     let query = original_uri.query().unwrap_or_default();
     if original_uri.query().is_some() || !canonical_path(original_uri.path()) {
         return Err(AppError::MalformedRequest);
@@ -64,69 +79,84 @@ pub async fn authenticate_device(
     let account_text = required_header(&headers, "x-nexxpass-account")?;
     let account_id = decode_exact(account_text, 32).map_err(|_| AppError::MalformedRequest)?;
     let key_kind = required_header(&headers, "x-nexxpass-key")?;
-    let (principal_kind, device_id, principal_id, public_key, account_status, revoked) =
-        match key_kind {
-            "device" => {
-                let device_text = required_header(&headers, "x-nexxpass-device")?;
-                let device_id =
-                    Uuid::parse_str(device_text).map_err(|_| AppError::MalformedRequest)?;
-                if device_id.to_string() != device_text {
-                    return Err(AppError::MalformedRequest);
-                }
-                let row = sqlx::query(
-                    "SELECT a.status, d.device_ed25519_pub, (d.revoked_at IS NOT NULL) AS is_revoked \
-                     FROM accounts a JOIN devices d ON d.account_id = a.account_id \
-                     WHERE a.account_id = $1 AND d.device_id = $2",
-                )
-                .bind(&account_id)
-                .bind(device_id)
-                .fetch_optional(&state.database)
-                .await?;
-                let Some(row) = row else {
-                    return Err(AppError::InvalidSignature);
-                };
-                let public_key: Vec<u8> = row.try_get("device_ed25519_pub")?;
-                let status: String = row.try_get("status")?;
-                let revoked: bool = row.try_get("is_revoked")?;
-                let mut principal_id = account_id.clone();
-                principal_id.extend_from_slice(device_id.as_bytes());
-                (
-                    PrincipalKind::Device,
-                    Some(device_id),
-                    principal_id,
-                    public_key,
-                    status,
-                    revoked,
-                )
+    let (
+        principal_kind,
+        device_id,
+        principal_id,
+        public_key,
+        account_status,
+        revoked,
+        revoked_reason,
+        revocation_proof,
+    ) = match key_kind {
+        "device" => {
+            let device_text = required_header(&headers, "x-nexxpass-device")?;
+            let device_id = Uuid::parse_str(device_text).map_err(|_| AppError::MalformedRequest)?;
+            if device_id.to_string() != device_text {
+                return Err(AppError::MalformedRequest);
             }
-            "identity" => {
-                if headers.contains_key("x-nexxpass-device") {
-                    return Err(AppError::MalformedRequest);
-                }
-                let row = sqlx::query(
-                    "SELECT status, identity_ed25519_pub FROM accounts WHERE account_id = $1",
-                )
-                .bind(&account_id)
-                .fetch_optional(&state.database)
-                .await?;
-                let Some(row) = row else {
-                    return Err(AppError::InvalidSignature);
-                };
-                let public_key: Vec<u8> = row.try_get("identity_ed25519_pub")?;
-                let status: String = row.try_get("status")?;
-                let mut principal_id = account_id.clone();
-                principal_id.extend_from_slice(b"identity");
-                (
-                    PrincipalKind::Identity,
-                    None,
-                    principal_id,
-                    public_key,
-                    status,
-                    false,
-                )
+            let row = sqlx::query(
+                "SELECT a.status, d.device_ed25519_pub, (d.revoked_at IS NOT NULL) AS is_revoked, \
+                        d.revoked_reason, d.revocation_proof \
+                 FROM accounts a JOIN devices d ON d.account_id = a.account_id \
+                 WHERE a.account_id = $1 AND d.device_id = $2",
+            )
+            .bind(&account_id)
+            .bind(device_id)
+            .fetch_optional(&state.database)
+            .await?;
+            let Some(row) = row else {
+                return Err(AppError::InvalidSignature);
+            };
+            let public_key: Vec<u8> = row.try_get("device_ed25519_pub")?;
+            let status: String = row.try_get("status")?;
+            let revoked: bool = row.try_get("is_revoked")?;
+            let revoked_reason: Option<String> = row.try_get("revoked_reason")?;
+            let revocation_proof_bytes: Option<Vec<u8>> = row.try_get("revocation_proof")?;
+            let revocation_proof = revocation_proof_bytes.map(|b| URL_SAFE_NO_PAD.encode(b));
+            let mut principal_id = account_id.clone();
+            principal_id.extend_from_slice(device_id.as_bytes());
+            (
+                PrincipalKind::Device,
+                Some(device_id),
+                principal_id,
+                public_key,
+                status,
+                revoked,
+                revoked_reason,
+                revocation_proof,
+            )
+        }
+        "identity" => {
+            if headers.contains_key("x-nexxpass-device") {
+                return Err(AppError::MalformedRequest);
             }
-            _ => return Err(AppError::MalformedRequest),
-        };
+            let row = sqlx::query(
+                "SELECT status, identity_ed25519_pub FROM accounts WHERE account_id = $1",
+            )
+            .bind(&account_id)
+            .fetch_optional(&state.database)
+            .await?;
+            let Some(row) = row else {
+                return Err(AppError::InvalidSignature);
+            };
+            let public_key: Vec<u8> = row.try_get("identity_ed25519_pub")?;
+            let status: String = row.try_get("status")?;
+            let mut principal_id = account_id.clone();
+            principal_id.extend_from_slice(b"identity");
+            (
+                PrincipalKind::Identity,
+                None,
+                principal_id,
+                public_key,
+                status,
+                false,
+                None,
+                None,
+            )
+        }
+        _ => return Err(AppError::MalformedRequest),
+    };
 
     let nonce = verify_raw_signature(
         &headers,
@@ -141,21 +171,83 @@ pub async fn authenticate_device(
     if account_status == "suspended" {
         return Err(AppError::AccountSuspended);
     }
+    // Check device revocation BEFORE sync_disabled / identity_locked so that any revoked
+    // device (including devices revoked when another device disabled sync) always receives
+    // the explicit 403 `device_revoked` remote-wipe signal.
+    if revoked {
+        return Err(AppError::DeviceRevokedWithDetails {
+            reason: revoked_reason,
+            revocation_proof,
+        });
+    }
+    if account_status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
+    }
     if principal_kind == PrincipalKind::Identity && account_status == "identity_locked" {
         return Err(AppError::IdentityLocked);
     }
-    if revoked {
-        return Err(AppError::DeviceRevoked);
-    }
 
     let principal = AuthenticatedPrincipal {
-        account_id,
+        account_id: account_id.clone(),
         kind: principal_kind,
         device_id,
     };
     parts.extensions.insert(principal);
     let request = Request::from_parts(parts, Body::from(body));
-    Ok(next.run(request).await)
+    let mut response = next.run(request).await;
+
+    if let Some(dev_id) = device_id {
+        if let Ok(now_dur) = SystemTime::now().duration_since(UNIX_EPOCH) {
+            let server_time_unix = now_dur.as_secs();
+            let lease_expires_unix = server_time_unix.saturating_add(OFFLINE_LEASE_SECONDS);
+            if let Ok(lease_token) = compute_offline_lease_token(
+                &state.token_hmac_key,
+                &account_id,
+                &dev_id,
+                server_time_unix,
+                lease_expires_unix,
+            ) {
+                let headers_mut = response.headers_mut();
+                if let Ok(val) = HeaderValue::from_str(&server_time_unix.to_string()) {
+                    headers_mut.insert(HeaderName::from_static("x-nexxpass-server-time"), val);
+                }
+                if let Ok(val) = HeaderValue::from_str(&lease_expires_unix.to_string()) {
+                    headers_mut.insert(HeaderName::from_static("x-nexxpass-lease-expires"), val);
+                }
+                headers_mut.insert(
+                    HeaderName::from_static("x-nexxpass-lease-ttl"),
+                    HeaderValue::from_static("604800"),
+                );
+                if let Ok(val) = HeaderValue::from_str(&lease_token) {
+                    headers_mut.insert(HeaderName::from_static("x-nexxpass-lease-token"), val);
+                }
+            }
+        }
+    }
+
+    Ok(response)
+}
+
+pub fn compute_offline_lease_token(
+    token_hmac_key: &[u8; 32],
+    account_id: &[u8],
+    device_id: &Uuid,
+    server_time_unix: u64,
+    lease_expires_unix: u64,
+) -> Result<String, AppError> {
+    let mut mac = HmacSha256::new_from_slice(token_hmac_key).map_err(|_| AppError::Unavailable)?;
+    mac.update(b"NPSLease1");
+    mac.update(account_id);
+    mac.update(device_id.as_bytes());
+    mac.update(&server_time_unix.to_be_bytes());
+    mac.update(&lease_expires_unix.to_be_bytes());
+    let tag = mac.finalize().into_bytes();
+
+    let mut raw = [0u8; 32];
+    raw[0..8].copy_from_slice(&server_time_unix.to_be_bytes());
+    raw[8..16].copy_from_slice(&lease_expires_unix.to_be_bytes());
+    raw[16..32].copy_from_slice(&tag[0..16]);
+    Ok(URL_SAFE_NO_PAD.encode(raw))
 }
 
 pub fn verify_raw_signature(
@@ -267,6 +359,9 @@ pub async fn lock_active_device_for_mutation(
     }
     if account_status == "deletion_pending" {
         return Err(AppError::AccountDeletionPending);
+    }
+    if account_status == "sync_disabled" {
+        return Err(AppError::SyncDisabled);
     }
 
     let revoked: Option<bool> = sqlx::query_scalar(

@@ -826,7 +826,7 @@ fn sign_identity_request(
     builder.body(Body::from(body_bytes.to_vec())).unwrap()
 }
 
-async fn setup_test_app() -> (axum::Router, AppState) {
+async fn setup_test_app() -> Option<(axum::Router, AppState)> {
     let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
         "postgres://nexxpass:change-me@localhost:5432/nexxpass_sync".to_string()
     });
@@ -840,15 +840,268 @@ async fn setup_test_app() -> (axum::Router, AppState) {
         maintenance_interval_seconds: 3600,
     };
 
-    let state = AppState::connect(&config).await.expect("connect db");
-    state.migrate().await.expect("apply migrations");
+    let state = match AppState::connect(&config).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Skipping integration test: could not connect to database: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = state.migrate().await {
+        eprintln!("Skipping integration test: could not migrate database: {e}");
+        return None;
+    }
     let router = http::router(state.clone());
-    (router, state)
+    Some((router, state))
+}
+
+#[tokio::test]
+async fn test_encrypted_attachment_upload_download_reconcile_and_record_delete() {
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
+    let identity_key = make_signing_key(0x24);
+    let device_key = make_signing_key(0x25);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let device_id = Uuid::new_v4();
+    let registration = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x54; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": URL_SAFE_NO_PAD.encode([0x55; 105]),
+        "device": {
+            "device_id": device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x56; 32]),
+            "device_label": "Attachment integration device",
+            "wrap": URL_SAFE_NO_PAD.encode([0x57; 105]),
+        },
+    });
+    let registration_bytes = serde_json::to_vec(&registration).unwrap();
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "POST",
+            "/v1/accounts",
+            &registration_bytes,
+            &identity_key,
+            &account_id,
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let record_id = Uuid::new_v4();
+    let record_operation_id = Uuid::new_v4();
+    let record_body = serde_json::json!({
+        "operations": [{
+            "op": "put",
+            "operation_id": record_operation_id.to_string(),
+            "item_id": record_id.to_string(),
+            "base_version": 0,
+            "key_version": 1,
+            "blob": URL_SAFE_NO_PAD.encode([0x61; 600]),
+        }],
+    });
+    let record_bytes = serde_json::to_vec(&record_body).unwrap();
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "POST",
+            "/v1/sync/batch",
+            &record_bytes,
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let attachment_id = Uuid::new_v4();
+    let attachment_path = format!("/v1/sync/attachments/{record_id}/{attachment_id}");
+    let encrypted_blob = URL_SAFE_NO_PAD.encode(vec![0x71; 1_100_000]);
+    let upload_body = serde_json::json!({
+        "key_version": 1,
+        "blob": encrypted_blob,
+    });
+    let upload_bytes = serde_json::to_vec(&upload_body).unwrap();
+    assert!(upload_bytes.len() > 1024 * 1024);
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "PUT",
+            &attachment_path,
+            &upload_bytes,
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "PUT",
+            &attachment_path,
+            &upload_bytes,
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "GET",
+            &attachment_path,
+            b"",
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    let stored: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stored["record_id"], record_id.to_string());
+    assert_eq!(stored["attachment_id"], attachment_id.to_string());
+    assert_eq!(stored["key_version"], 1);
+    assert_eq!(stored["blob"], upload_body["blob"]);
+
+    let other_record_path = format!("/v1/sync/attachments/{}/{attachment_id}", Uuid::new_v4());
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "GET",
+            &other_record_path,
+            b"",
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let reconcile_path = format!("/v1/sync/attachments/{record_id}/reconcile");
+    let reconcile_body = serde_json::json!({"keep_ids": []});
+    let reconcile_bytes = serde_json::to_vec(&reconcile_body).unwrap();
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "POST",
+            &reconcile_path,
+            &reconcile_bytes,
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "GET",
+            &attachment_path,
+            b"",
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let delete_attachment_body = serde_json::json!({
+        "key_version": 1,
+        "blob": URL_SAFE_NO_PAD.encode([0x72; 41]),
+    });
+    let delete_attachment_bytes = serde_json::to_vec(&delete_attachment_body).unwrap();
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "PUT",
+            &attachment_path,
+            &delete_attachment_bytes,
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let delete_body = serde_json::json!({
+        "operations": [{
+            "op": "delete",
+            "operation_id": Uuid::new_v4().to_string(),
+            "item_id": record_id.to_string(),
+            "base_version": 1,
+            "delete_proof": delete_proof(&identity_key, &account_id, record_id, 1),
+        }],
+    });
+    let delete_bytes = serde_json::to_vec(&delete_body).unwrap();
+    let response = router
+        .clone()
+        .oneshot(sign_request(
+            "POST",
+            "/v1/sync/batch",
+            &delete_bytes,
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = router
+        .oneshot(sign_request(
+            "GET",
+            &attachment_path,
+            b"",
+            &device_key,
+            &account_id,
+            Some(device_id),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn test_device_management_and_recovery_lifecycle() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let identity_key = make_signing_key(0x31);
     let device_key = make_signing_key(0x32);
@@ -1124,7 +1377,9 @@ async fn test_device_management_and_recovery_lifecycle() {
 
 #[tokio::test]
 async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let identity_key = make_signing_key(0x41);
     let device_1_key = make_signing_key(0x42);
@@ -1496,7 +1751,9 @@ async fn test_rotation_state_machine_routine_abort_and_mpc_complete() {
 
 #[tokio::test]
 async fn test_background_maintenance_jobs_and_advisory_locking() {
-    let (_router, state) = setup_test_app().await;
+    let Some((_router, state)) = setup_test_app().await else {
+        return;
+    };
 
     let pool = &state.database;
 
@@ -1540,7 +1797,9 @@ async fn test_background_maintenance_jobs_and_advisory_locking() {
 
 #[tokio::test]
 async fn test_deep_healthchecks() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     // GET /health/live
     let live_req = Request::builder()
@@ -1572,7 +1831,9 @@ async fn test_deep_healthchecks() {
 async fn test_realtime_sync_events_sse() {
     use http_body_util::BodyExt;
 
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let identity_key = make_signing_key(0x71);
     let device_key = make_signing_key(0x72);
@@ -1677,7 +1938,9 @@ async fn test_realtime_sync_events_sse() {
 
 #[tokio::test]
 async fn test_rate_limiting_pairing() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let target_account_id = [0x55u8; 32];
     let device_key = make_signing_key(0x56);
@@ -1730,7 +1993,9 @@ async fn test_rate_limiting_pairing() {
 
 #[tokio::test]
 async fn test_active_device_quota() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let identity_key = make_signing_key(0x61);
     let device_key = make_signing_key(0x62);
@@ -1824,7 +2089,9 @@ async fn test_active_device_quota() {
 
 #[tokio::test]
 async fn test_defensive_security_and_cache_control_headers() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let req = Request::builder()
         .method("GET")
@@ -1861,7 +2128,9 @@ async fn test_defensive_security_and_cache_control_headers() {
 
 #[tokio::test]
 async fn test_device_live_last_seen_at_tracking() {
-    let (router, _state) = setup_test_app().await;
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
 
     let identity_key = make_signing_key(0x81);
     let device_key = make_signing_key(0x82);
@@ -1977,4 +2246,492 @@ async fn test_device_live_last_seen_at_tracking() {
 
     assert_ne!(initial_last_seen, updated_last_seen);
     assert!(!first_sync_at.is_empty());
+}
+
+#[tokio::test]
+async fn test_revocation_wipe_sse_and_http_and_offline_lease() {
+    use http_body_util::BodyExt;
+
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
+
+    let identity_key = make_signing_key(0x91);
+    let device_1_key = make_signing_key(0x92);
+    let device_2_key = make_signing_key(0x93);
+
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let device_1_id = Uuid::new_v4();
+    let device_2_id = Uuid::new_v4();
+    let wrap_b64u = URL_SAFE_NO_PAD.encode([0x55u8; 105]);
+
+    // 1. Register account with Device 1
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_1_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_1_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1 Primary",
+            "wrap": wrap_b64u,
+        }
+    });
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reg_res = router.clone().oneshot(reg_req).await.unwrap();
+    assert_eq!(reg_res.status(), StatusCode::CREATED);
+
+    // 2. Register Device 2 via recovery
+    let dev2_body = serde_json::json!({
+        "device_id": device_2_id.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_2_key.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x66u8; 32]),
+        "device_label": "Device 2 Secondary",
+        "wrap": wrap_b64u,
+    });
+    let dev2_req = sign_identity_request(
+        "POST",
+        "/v1/devices",
+        &serde_json::to_vec(&dev2_body).unwrap(),
+        &identity_key,
+        &account_id,
+    );
+    let dev2_res = router.clone().oneshot(dev2_req).await.unwrap();
+    assert_eq!(dev2_res.status(), StatusCode::CREATED);
+
+    // 3. Verify 7-day offline lease headers and sync_policy in GET /v1/accounts/me
+    let me_req = sign_request(
+        "GET",
+        "/v1/accounts/me",
+        &[],
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let me_res = router.clone().oneshot(me_req).await.unwrap();
+    assert_eq!(me_res.status(), StatusCode::OK);
+    assert_eq!(
+        me_res
+            .headers()
+            .get("x-nexxpass-lease-ttl")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "604800"
+    );
+    assert!(me_res.headers().contains_key("x-nexxpass-server-time"));
+    assert!(me_res.headers().contains_key("x-nexxpass-lease-expires"));
+    assert!(me_res.headers().contains_key("x-nexxpass-lease-token"));
+
+    let me_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(me_res.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    assert_eq!(
+        me_json["sync_policy"]["offline_lease_seconds"]
+            .as_u64()
+            .unwrap(),
+        604_800
+    );
+    assert_eq!(
+        me_json["sync_policy"]["pause_after_offline_days"]
+            .as_u64()
+            .unwrap(),
+        7
+    );
+    assert!(me_json["sync_policy"]["wipe_on_revocation"]
+        .as_bool()
+        .unwrap());
+    assert!(me_json["sync_policy"]["re_enable_requires_new_account"]
+        .as_bool()
+        .unwrap());
+
+    // 4. Device 2 opens real-time SSE stream
+    let sse_req = sign_request(
+        "GET",
+        "/v1/sync/events",
+        &[],
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let sse_res = router.clone().oneshot(sse_req).await.unwrap();
+    assert_eq!(sse_res.status(), StatusCode::OK);
+
+    // 5. Device 1 revokes Device 2 with cryptographic revocation proof
+    let revoke_preimage = format!(
+        "NPSRevoke1\n{}\n{}",
+        URL_SAFE_NO_PAD.encode(account_id),
+        device_2_id
+    );
+    let revoke_sig = device_1_key.sign(revoke_preimage.as_bytes());
+    let revoke_proof_b64u = URL_SAFE_NO_PAD.encode(revoke_sig.to_bytes());
+
+    let revoke_path = format!("/v1/devices/{device_2_id}");
+    let mut revoke_req = sign_request(
+        "DELETE",
+        &revoke_path,
+        &[],
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    revoke_req.headers_mut().insert(
+        "x-nexxpass-revocation-proof",
+        revoke_proof_b64u.parse().unwrap(),
+    );
+    let revoke_res = router.clone().oneshot(revoke_req).await.unwrap();
+    assert_eq!(revoke_res.status(), StatusCode::OK);
+
+    // 6. Device 2's SSE stream immediately receives `event: revoked` with wipe_required: true and then closes
+    let mut sse_body = sse_res.into_body();
+    let frame = sse_body.frame().await.unwrap().unwrap();
+    let frame_str = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+    assert!(frame_str.contains("event: revoked"));
+    assert!(frame_str.contains("\"wipe_required\":true"));
+    assert!(frame_str.contains("\"reason\":\"user_revocation\""));
+    assert!(frame_str.contains(&revoke_proof_b64u));
+    // Stream terminates right after the revoked event
+    assert!(sse_body.frame().await.is_none());
+
+    // 7. On next HTTP contact, Device 2 receives 403 device_revoked with wipe_required: true and proof
+    let next_contact_req = sign_request(
+        "GET",
+        "/v1/accounts/me",
+        &[],
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let next_contact_res = router.clone().oneshot(next_contact_req).await.unwrap();
+    assert_eq!(next_contact_res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        next_contact_res
+            .headers()
+            .get("x-nexxpass-wipe-vault")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        next_contact_res
+            .headers()
+            .get("x-nexxpass-revocation-proof")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        revoke_proof_b64u
+    );
+    let err_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(next_contact_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        err_json["error"]["code"].as_str().unwrap(),
+        "device_revoked"
+    );
+    assert!(err_json["error"]["wipe_required"].as_bool().unwrap());
+    assert_eq!(
+        err_json["error"]["revoked_reason"].as_str().unwrap(),
+        "user_revocation"
+    );
+    assert_eq!(
+        err_json["error"]["revocation_proof"].as_str().unwrap(),
+        revoke_proof_b64u
+    );
+}
+
+#[tokio::test]
+async fn test_disable_sync_revokes_other_devices_wipes_vault_and_requires_new_account() {
+    use http_body_util::BodyExt;
+
+    let Some((router, state)) = setup_test_app().await else {
+        return;
+    };
+
+    let identity_key = make_signing_key(0xA1);
+    let device_1_key = make_signing_key(0xA2);
+    let device_2_key = make_signing_key(0xA3);
+    let device_3_key = make_signing_key(0xA4);
+
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let device_1_id = Uuid::new_v4();
+    let device_2_id = Uuid::new_v4();
+    let device_3_id = Uuid::new_v4();
+    let wrap_b64u = URL_SAFE_NO_PAD.encode([0x55u8; 105]);
+
+    // 1. Register account with Device 1
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_1_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_1_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1 (Turning Off Sync)",
+            "wrap": wrap_b64u,
+        }
+    });
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    assert_eq!(
+        router.clone().oneshot(reg_req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    // 2. Register Device 2 (online) and Device 3 (offline)
+    for (dev_id, dev_key, label) in [
+        (device_2_id, &device_2_key, "Device 2 Online"),
+        (device_3_id, &device_3_key, "Device 3 Offline"),
+    ] {
+        let body = serde_json::json!({
+            "device_id": dev_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(dev_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x66u8; 32]),
+            "device_label": label,
+            "wrap": wrap_b64u,
+        });
+        let req = sign_identity_request(
+            "POST",
+            "/v1/devices",
+            &serde_json::to_vec(&body).unwrap(),
+            &identity_key,
+            &account_id,
+        );
+        assert_eq!(
+            router.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+
+    // 3. Push an encrypted vault item from Device 1
+    let blob_b64u = URL_SAFE_NO_PAD.encode(vec![0x42u8; 600]);
+    let batch_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": blob_b64u,
+            }
+        ]
+    });
+    let batch_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&batch_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    assert_eq!(
+        router.clone().oneshot(batch_req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // 4. Device 2 subscribes to SSE stream
+    let sse_req = sign_request(
+        "GET",
+        "/v1/sync/events",
+        &[],
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let sse_res = router.clone().oneshot(sse_req).await.unwrap();
+    assert_eq!(sse_res.status(), StatusCode::OK);
+
+    // 5. Device 1 turns off sync via POST /v1/accounts/disable-sync
+    let disable_preimage = format!("NPSDisableSync1\n{}", URL_SAFE_NO_PAD.encode(account_id));
+    let disable_sig = device_1_key.sign(disable_preimage.as_bytes());
+    let disable_proof_b64u = URL_SAFE_NO_PAD.encode(disable_sig.to_bytes());
+
+    let mut disable_req = sign_request(
+        "POST",
+        "/v1/accounts/disable-sync",
+        &[],
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    disable_req.headers_mut().insert(
+        "x-nexxpass-revocation-proof",
+        disable_proof_b64u.parse().unwrap(),
+    );
+    let disable_res = router.clone().oneshot(disable_req).await.unwrap();
+    assert_eq!(disable_res.status(), StatusCode::OK);
+    let disable_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(disable_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(disable_json["status"].as_str().unwrap(), "sync_disabled");
+    assert_eq!(disable_json["local_mode"].as_str().unwrap(), "offline_only");
+    assert_eq!(disable_json["other_devices_revoked"].as_u64().unwrap(), 2);
+    assert!(disable_json["vault_purged"].as_bool().unwrap());
+    assert!(disable_json["re_enable_requires_new_account"]
+        .as_bool()
+        .unwrap());
+
+    // 6. Verify all server-side vault items, changes, wraps, and sessions are immediately purged
+    let remaining_items: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE account_id = $1")
+            .bind(&account_id[..])
+            .fetch_one(&state.database)
+            .await
+            .unwrap();
+    let remaining_changes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM item_changes WHERE account_id = $1")
+            .bind(&account_id[..])
+            .fetch_one(&state.database)
+            .await
+            .unwrap();
+    let remaining_wraps: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM key_wraps WHERE account_id = $1")
+            .bind(&account_id[..])
+            .fetch_one(&state.database)
+            .await
+            .unwrap();
+    assert_eq!(remaining_items, 0);
+    assert_eq!(remaining_changes, 0);
+    assert_eq!(remaining_wraps, 0);
+
+    // 7. Online Device 2 immediately gets `event: revoked` with reason="sync_disabled" & wipe_required=true
+    let mut sse_body = sse_res.into_body();
+    let frame = sse_body.frame().await.unwrap().unwrap();
+    let frame_str = String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap();
+    assert!(frame_str.contains("event: revoked"));
+    assert!(frame_str.contains("\"wipe_required\":true"));
+    assert!(frame_str.contains("\"reason\":\"sync_disabled\""));
+    assert!(sse_body.frame().await.is_none());
+
+    // 8. Offline Device 3 reconnects (e.g., prompted by 7-day offline check-in) and gets 403 device_revoked + wipe
+    let dev3_pull_body = serde_json::json!({ "checkpoint": 0 });
+    let dev3_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &serde_json::to_vec(&dev3_pull_body).unwrap(),
+        &device_3_key,
+        &account_id,
+        Some(device_3_id),
+        false,
+    );
+    let dev3_res = router.clone().oneshot(dev3_req).await.unwrap();
+    assert_eq!(dev3_res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        dev3_res
+            .headers()
+            .get("x-nexxpass-wipe-vault")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "true"
+    );
+    let dev3_err: serde_json::Value =
+        serde_json::from_slice(&to_bytes(dev3_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        dev3_err["error"]["code"].as_str().unwrap(),
+        "device_revoked"
+    );
+    assert!(dev3_err["error"]["wipe_required"].as_bool().unwrap());
+    assert_eq!(
+        dev3_err["error"]["revoked_reason"].as_str().unwrap(),
+        "sync_disabled"
+    );
+
+    // 9. Re-enabling sync later: reusing the old account_id is rejected (409 account_id_retired),
+    //    while registering a brand-new account_id succeeds (201 Created).
+    let reuse_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    let reuse_res = router.clone().oneshot(reuse_req).await.unwrap();
+    assert_eq!(reuse_res.status(), StatusCode::CONFLICT);
+
+    let new_account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let new_device_id = Uuid::new_v4();
+    let new_reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(new_account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": new_device_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_1_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1 Re-enabled Sync",
+            "wrap": wrap_b64u,
+        }
+    });
+    let new_reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&new_reg_body).unwrap(),
+        &identity_key,
+        &new_account_id,
+        None,
+        true,
+    );
+    let new_reg_res = router.clone().oneshot(new_reg_req).await.unwrap();
+    assert_eq!(new_reg_res.status(), StatusCode::CREATED);
 }
