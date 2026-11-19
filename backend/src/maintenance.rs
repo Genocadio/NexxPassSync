@@ -82,6 +82,27 @@ pub async fn cleanup_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> 
         .await?;
     total += res.rows_affected();
 
+    // Purge stale revoked devices (and their leftover key_wraps) after 7 days
+    // so revoked sessions are never persisted indefinitely.
+    let res = sqlx::query(
+        "DELETE FROM key_wraps kw \
+         USING devices d \
+         WHERE kw.account_id = d.account_id \
+           AND kw.recipient = d.device_id::text \
+           AND d.revoked_at IS NOT NULL \
+           AND d.revoked_at < now() - interval '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    total += res.rows_affected();
+
+    let res = sqlx::query(
+        "DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at < now() - interval '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    total += res.rows_affected();
+
     let res = sqlx::query("DELETE FROM operations WHERE created_at < now() - interval '30 days'")
         .execute(pool)
         .await?;

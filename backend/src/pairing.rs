@@ -253,16 +253,36 @@ pub async fn approve_pairing(
         _ => return Err(AppError::PairingChallengeInvalid),
     };
 
-    let device_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM devices WHERE account_id = $1 AND device_id = $2)",
+    let active_device_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM devices WHERE account_id = $1 AND device_id = $2 AND revoked_at IS NULL)",
     )
     .bind(&approval.account_id)
     .bind(approval.device_id)
     .fetch_one(&mut *tx)
     .await?;
-    if device_exists {
+    if active_device_exists {
         return Err(AppError::PairingChallengeInvalid);
     }
+
+    // If this device_id was previously revoked, purge its stale revoked row and wraps
+    // so re-pairing is never blocked.
+    sqlx::query("DELETE FROM key_wraps WHERE account_id = $1 AND recipient = $2")
+        .bind(&approval.account_id)
+        .bind(approval.device_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM sync_sessions WHERE account_id = $1 AND device_id = $2")
+        .bind(&approval.account_id)
+        .bind(approval.device_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM devices WHERE account_id = $1 AND device_id = $2 AND revoked_at IS NOT NULL",
+    )
+    .bind(&approval.account_id)
+    .bind(approval.device_id)
+    .execute(&mut *tx)
+    .await?;
 
     let active_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM devices WHERE account_id = $1 AND revoked_at IS NULL",
