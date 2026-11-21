@@ -489,7 +489,7 @@ pub async fn handle_sync_batch(
                         results.push(OperationResult {
                             operation_id: mutation.operation_id.to_string(),
                             status: "base_version_conflict".to_string(),
-                            version: None,
+                            version: Some(item_row.version as u64),
                             seq: None,
                         });
                         continue;
@@ -592,7 +592,7 @@ pub async fn handle_sync_batch(
                     results.push(OperationResult {
                         operation_id: mutation.operation_id.to_string(),
                         status: "base_version_conflict".to_string(),
-                        version: None,
+                        version: Some(item_row.version as u64),
                         seq: None,
                     });
                     continue;
