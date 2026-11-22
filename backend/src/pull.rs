@@ -478,7 +478,10 @@ pub async fn handle_sync_pull(
         if (checkpoint as i64) < tombstone_floor || (checkpoint as i64) < change_floor {
             return Err(AppError::ResyncRequired);
         }
-        if checkpoint != last_seen_seq as u64 {
+        // Accept any checkpoint <= last_seen_seq (above floors) so a client
+        // whose local watermark lags behind the server's acknowledged cursor
+        // can safely replay without error; only reject checkpoints ahead of server.
+        if checkpoint > last_seen_seq as u64 {
             return Err(AppError::InvalidInput);
         }
     }
@@ -690,12 +693,13 @@ pub async fn handle_sync_ack(
             .await?;
         }
     } else {
-        // For full snapshot, advance last_seen_seq and set first_sync_at ONLY on the final completed page.
+        // For full snapshot, advance last_seen_seq monotonically (never regress
+        // past a higher committed cursor) and set first_sync_at on the final page.
         let is_completed: bool = session_row.try_get("is_completed")?;
         if is_completed && request.terminal_seq as i64 == high_watermark {
-            last_seen_seq = high_watermark;
+            last_seen_seq = last_seen_seq.max(high_watermark);
             sqlx::query(
-                "UPDATE devices SET last_seen_seq = $3, first_sync_at = COALESCE(first_sync_at, now()) \
+                "UPDATE devices SET last_seen_seq = GREATEST(last_seen_seq, $3), first_sync_at = COALESCE(first_sync_at, now()) \
                  WHERE account_id = $1 AND device_id = $2",
             )
             .bind(&account_id)

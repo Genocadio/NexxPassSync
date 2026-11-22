@@ -44,10 +44,24 @@ pub struct RecoveryDeviceRegistration {
     pub target_wrap: Option<String>,
 }
 
+pub const DELETION_GRACE_DAYS: u32 = 10;
+
 #[derive(Serialize)]
 pub struct DeviceRegistrationResult {
     pub device_id: String,
     pub active_key_version: i64,
+}
+
+#[derive(Serialize)]
+pub struct DeviceRevocationResult {
+    pub device_id: String,
+    pub active_key_version: i64,
+    pub was_last_device: bool,
+    pub remaining_active_devices: i64,
+    pub account_status: String,
+    pub deletion_grace_days: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion_scheduled_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -428,7 +442,7 @@ pub async fn revoke_device(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     headers: HeaderMap,
     Path(target_device_id_str): Path<String>,
-) -> Result<Json<DeviceRegistrationResult>, AppError> {
+) -> Result<Json<DeviceRevocationResult>, AppError> {
     if principal.kind != PrincipalKind::Device {
         return Err(AppError::InvalidSignature);
     }
@@ -555,6 +569,54 @@ pub async fn revoke_device(
         .await?;
     }
 
+    let remaining_active_devices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM devices WHERE account_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&principal.account_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let mut account_status: String =
+        sqlx::query_scalar("SELECT status FROM accounts WHERE account_id = $1")
+            .bind(&principal.account_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    let mut deletion_scheduled_at: Option<String> = None;
+    let was_last_device = remaining_active_devices == 0;
+
+    if was_last_device && account_status != "deletion_pending" {
+        let scheduled_row = sqlx::query(
+            "UPDATE accounts \
+             SET status = 'deletion_pending', deletion_requested_at = now() \
+             WHERE account_id = $1 \
+             RETURNING to_char((deletion_requested_at + interval '10 days') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS deletion_scheduled_at",
+        )
+        .bind(&principal.account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        deletion_scheduled_at = scheduled_row.try_get("deletion_scheduled_at")?;
+        account_status = "deletion_pending".to_string();
+
+        let del_event_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO account_events (account_id, event_id, event_type, actor, actor_device_id) \
+             VALUES ($1, $2, 'deletion_requested', 'device', $3)",
+        )
+        .bind(&principal.account_id)
+        .bind(del_event_id)
+        .bind(caller_device_id)
+        .execute(&mut *tx)
+        .await?;
+    } else if account_status == "deletion_pending" {
+        deletion_scheduled_at = sqlx::query_scalar(
+            "SELECT to_char((deletion_requested_at + interval '10 days') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+             FROM accounts WHERE account_id = $1",
+        )
+        .bind(&principal.account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    }
+
     tx.commit().await?;
 
     if !is_revoked {
@@ -567,9 +629,14 @@ pub async fn revoke_device(
         });
     }
 
-    Ok(Json(DeviceRegistrationResult {
+    Ok(Json(DeviceRevocationResult {
         device_id: target_device_id.to_string(),
         active_key_version,
+        was_last_device,
+        remaining_active_devices,
+        account_status,
+        deletion_grace_days: DELETION_GRACE_DAYS,
+        deletion_scheduled_at,
     }))
 }
 

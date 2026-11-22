@@ -82,13 +82,51 @@ pub async fn cleanup_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> 
         .await?;
     total += res.rows_affected();
 
-    // Purge stale revoked devices (and their leftover key_wraps) after 7 days
-    // so revoked sessions are never persisted indefinitely.
+    // Purge stale revoked devices (and their leftover key_wraps & FK references)
+    // after 7 days so revoked sessions are never persisted indefinitely.
     let res = sqlx::query(
         "DELETE FROM key_wraps kw \
          USING devices d \
          WHERE kw.account_id = d.account_id \
            AND kw.recipient = d.device_id::text \
+           AND d.revoked_at IS NOT NULL \
+           AND d.revoked_at < now() - interval '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    total += res.rows_affected();
+
+    let res = sqlx::query(
+        "UPDATE accounts a \
+         SET rotation_owner_device_id = NULL, rotation_lease_expires_at = NULL \
+         FROM devices d \
+         WHERE a.account_id = d.account_id \
+           AND a.rotation_owner_device_id = d.device_id \
+           AND d.revoked_at IS NOT NULL \
+           AND d.revoked_at < now() - interval '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    total += res.rows_affected();
+
+    let res = sqlx::query(
+        "UPDATE account_events ae \
+         SET actor_device_id = NULL \
+         FROM devices d \
+         WHERE ae.account_id = d.account_id \
+           AND ae.actor_device_id = d.device_id \
+           AND d.revoked_at IS NOT NULL \
+           AND d.revoked_at < now() - interval '7 days'",
+    )
+    .execute(pool)
+    .await?;
+    total += res.rows_affected();
+
+    let res = sqlx::query(
+        "DELETE FROM rotation_participants rp \
+         USING devices d \
+         WHERE rp.account_id = d.account_id \
+           AND rp.device_id = d.device_id \
            AND d.revoked_at IS NOT NULL \
            AND d.revoked_at < now() - interval '7 days'",
     )
@@ -644,13 +682,13 @@ pub async fn prune_superseded_item_changes(pool: &PgPool) -> Result<u64, sqlx::E
     Ok(total_pruned)
 }
 
-/// Hard-purges accounts whose 30-day deletion grace period or 30-day sync-disabled
+/// Hard-purges accounts whose 10-day deletion grace period or 30-day sync-disabled
 /// revocation window has ended.
 /// Writes account_id into `deleted_accounts` permanently, and deletes the account.
 pub async fn purge_deleted_accounts(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let pending_accounts = sqlx::query(
         "SELECT account_id FROM accounts \
-         WHERE (status = 'deletion_pending' AND deletion_requested_at < now() - interval '30 days') \
+         WHERE (status = 'deletion_pending' AND deletion_requested_at < now() - interval '10 days') \
             OR (status = 'sync_disabled' AND sync_disabled_at < now() - interval '30 days')",
     )
     .fetch_all(pool)

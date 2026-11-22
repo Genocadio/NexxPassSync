@@ -264,8 +264,8 @@ pub async fn approve_pairing(
         return Err(AppError::PairingChallengeInvalid);
     }
 
-    // If this device_id was previously revoked, purge its stale revoked row and wraps
-    // so re-pairing is never blocked.
+    // If this device_id was previously revoked, purge its stale revoked row,
+    // wraps, and FK references so re-pairing is never blocked.
     sqlx::query("DELETE FROM key_wraps WHERE account_id = $1 AND recipient = $2")
         .bind(&approval.account_id)
         .bind(approval.device_id.to_string())
@@ -276,6 +276,29 @@ pub async fn approve_pairing(
         .bind(approval.device_id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "UPDATE accounts SET rotation_owner_device_id = NULL, rotation_lease_expires_at = NULL \
+         WHERE account_id = $1 AND rotation_owner_device_id = $2",
+    )
+    .bind(&approval.account_id)
+    .bind(approval.device_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE account_events SET actor_device_id = NULL \
+         WHERE account_id = $1 AND actor_device_id = $2",
+    )
+    .bind(&approval.account_id)
+    .bind(approval.device_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM rotation_participants WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(&approval.account_id)
+    .bind(approval.device_id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query(
         "DELETE FROM devices WHERE account_id = $1 AND device_id = $2 AND revoked_at IS NOT NULL",
     )

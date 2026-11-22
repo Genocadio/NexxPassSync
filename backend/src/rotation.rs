@@ -1109,5 +1109,8 @@ pub async fn rewrite_rotation(
         });
     }
 
-    Ok(Json(BatchResponse { results }))
+    Ok(Json(BatchResponse {
+        results,
+        new_watermark: None,
+    }))
 }

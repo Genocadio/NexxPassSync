@@ -52,6 +52,8 @@ pub struct MutationRequest {
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BatchResponse {
     pub results: Vec<OperationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_watermark: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -668,12 +670,32 @@ pub async fn handle_sync_batch(
         }
     }
 
+    let mut new_watermark: Option<u64> = None;
     if seq_counter != initial_seq_counter {
         sqlx::query("UPDATE accounts SET seq_counter = $2 WHERE account_id = $1")
             .bind(&account_id)
             .bind(seq_counter)
             .execute(&mut *tx)
             .await?;
+
+        // If the pushing device was already caught up to `initial_seq_counter`
+        // (no other device wrote in between), advance its checkpoint directly to
+        // `seq_counter` so its own pushed batch is not echoed back on the next pull.
+        let advanced_seq: Option<i64> = sqlx::query_scalar(
+            "UPDATE devices \
+             SET last_seen_seq = $3 \
+             WHERE account_id = $1 AND device_id = $2 AND last_seen_seq = $4 \
+             RETURNING last_seen_seq",
+        )
+        .bind(&account_id)
+        .bind(device_id)
+        .bind(seq_counter)
+        .bind(initial_seq_counter)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(seq) = advanced_seq {
+            new_watermark = Some(seq as u64);
+        }
 
         // Enforce the 100 MB (2x live quota) historical ciphertext cap on item_changes (Plan §8).
         let history_bytes: i64 = sqlx::query_scalar(
@@ -694,18 +716,34 @@ pub async fn handle_sync_batch(
             .await?;
 
             if active_sessions == 0 {
-                let pruned_seqs: Vec<i64> = sqlx::query_scalar(
-                    "DELETE FROM item_changes ic \
-                     USING items i \
-                     WHERE ic.account_id = $1 \
-                       AND i.account_id = ic.account_id \
-                       AND i.item_id = ic.item_id \
-                       AND ic.seq < i.seq \
-                     RETURNING ic.seq",
+                // Respect the active-device replication floor so we never prune
+                // superseded history rows that a lagging active device still needs.
+                let min_active_checkpoint: Option<i64> = sqlx::query_scalar(
+                    "SELECT MIN(last_seen_seq) FROM devices \
+                     WHERE account_id = $1 AND revoked_at IS NULL",
                 )
                 .bind(&account_id)
-                .fetch_all(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await?;
+
+                let pruned_seqs: Vec<i64> = if let Some(min_cp) = min_active_checkpoint {
+                    sqlx::query_scalar(
+                        "DELETE FROM item_changes ic \
+                         USING items i \
+                         WHERE ic.account_id = $1 \
+                           AND i.account_id = ic.account_id \
+                           AND i.item_id = ic.item_id \
+                           AND ic.seq < i.seq \
+                           AND ic.seq <= $2 \
+                         RETURNING ic.seq",
+                    )
+                    .bind(&account_id)
+                    .bind(min_cp)
+                    .fetch_all(&mut *tx)
+                    .await?
+                } else {
+                    Vec::new()
+                };
 
                 if let Some(max_pruned_seq) = pruned_seqs.into_iter().max() {
                     sqlx::query(
@@ -745,7 +783,10 @@ pub async fn handle_sync_batch(
         });
     }
 
-    Ok(Json(BatchResponse { results }))
+    Ok(Json(BatchResponse {
+        results,
+        new_watermark,
+    }))
 }
 
 struct SseDropGuard(std::sync::Arc<crate::state::Metrics>);
