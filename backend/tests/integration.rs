@@ -2938,7 +2938,7 @@ async fn test_pull_checkpoint_tolerance_and_push_new_watermark() {
                 "item_id": Uuid::new_v4().to_string(),
                 "base_version": 0,
                 "key_version": 1,
-                "blob": URL_SAFE_NO_PAD.encode([0x11u8; 64]),
+                "blob": URL_SAFE_NO_PAD.encode(vec![0x11u8; 600]),
             },
             {
                 "op": "put",
@@ -2946,7 +2946,7 @@ async fn test_pull_checkpoint_tolerance_and_push_new_watermark() {
                 "item_id": Uuid::new_v4().to_string(),
                 "base_version": 0,
                 "key_version": 1,
-                "blob": URL_SAFE_NO_PAD.encode([0x22u8; 64]),
+                "blob": URL_SAFE_NO_PAD.encode(vec![0x22u8; 600]),
             }
         ]
     });
