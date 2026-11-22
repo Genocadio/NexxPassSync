@@ -2735,3 +2735,266 @@ async fn test_disable_sync_revokes_other_devices_wipes_vault_and_requires_new_ac
     let new_reg_res = router.clone().oneshot(new_reg_req).await.unwrap();
     assert_eq!(new_reg_res.status(), StatusCode::CREATED);
 }
+
+#[tokio::test]
+async fn test_fk_device_purge_and_last_device_deletion_schedule() {
+    let Some((router, state)) = setup_test_app().await else {
+        return;
+    };
+
+    let identity_key = make_signing_key(0xB1);
+    let device_1_key = make_signing_key(0xB2);
+    let device_2_key = make_signing_key(0xB3);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let device_1_id = Uuid::new_v4();
+    let device_2_id = Uuid::new_v4();
+    let wrap_b64u = URL_SAFE_NO_PAD.encode([0x55u8; 105]);
+
+    // 1. Register account with Device 1
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_1_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_1_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1",
+            "wrap": wrap_b64u,
+        }
+    });
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    assert_eq!(
+        router.clone().oneshot(reg_req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    // 2. Register Device 2 via recovery
+    let dev2_body = serde_json::json!({
+        "device_id": device_2_id.to_string(),
+        "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_2_key.verifying_key().to_bytes()),
+        "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x66u8; 32]),
+        "device_label": "Device 2",
+        "wrap": wrap_b64u,
+    });
+    let dev2_req = sign_identity_request(
+        "POST",
+        "/v1/devices",
+        &serde_json::to_vec(&dev2_body).unwrap(),
+        &identity_key,
+        &account_id,
+    );
+    assert_eq!(
+        router.clone().oneshot(dev2_req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    // 3. Device 2 revokes itself (creating an account_events row with actor='device', actor_device_id=device_2_id)
+    let revoke_dev2_req = sign_request(
+        "DELETE",
+        &format!("/v1/devices/{device_2_id}"),
+        b"",
+        &device_2_key,
+        &account_id,
+        Some(device_2_id),
+        false,
+    );
+    let revoke_dev2_res = router.clone().oneshot(revoke_dev2_req).await.unwrap();
+    assert_eq!(revoke_dev2_res.status(), StatusCode::OK);
+    let revoke_dev2_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(revoke_dev2_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoke_dev2_json["was_last_device"].as_bool(), Some(false));
+    assert_eq!(
+        revoke_dev2_json["remaining_active_devices"].as_i64(),
+        Some(1)
+    );
+
+    // 4. Backdate revoked_at > 7 days and run maintenance cleanup (must not fail FK or account_events_check)
+    sqlx::query(
+        "UPDATE devices SET revoked_at = now() - interval '8 days' \
+         WHERE account_id = $1 AND device_id = $2",
+    )
+    .bind(account_id.as_slice())
+    .bind(device_2_id)
+    .execute(&state.database)
+    .await
+    .unwrap();
+
+    nexxpass_sync_server::maintenance::cleanup_expired_records(&state.database)
+        .await
+        .expect("cleanup_expired_records should purge stale revoked device cleanly");
+
+    let dev2_still_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM devices WHERE account_id = $1 AND device_id = $2)",
+    )
+    .bind(account_id.as_slice())
+    .bind(device_2_id)
+    .fetch_one(&state.database)
+    .await
+    .unwrap();
+    assert!(!dev2_still_exists);
+
+    // 5. Device 1 (last device) revokes itself -> schedules 10-day deletion_pending
+    let revoke_dev1_req = sign_request(
+        "DELETE",
+        &format!("/v1/devices/{device_1_id}"),
+        b"",
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let revoke_dev1_res = router.clone().oneshot(revoke_dev1_req).await.unwrap();
+    assert_eq!(revoke_dev1_res.status(), StatusCode::OK);
+    let revoke_dev1_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(revoke_dev1_res.into_body(), 1024 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(revoke_dev1_json["was_last_device"].as_bool(), Some(true));
+    assert_eq!(
+        revoke_dev1_json["account_status"].as_str(),
+        Some("deletion_pending")
+    );
+    assert_eq!(revoke_dev1_json["deletion_grace_days"].as_u64(), Some(10));
+    assert!(revoke_dev1_json["deletion_scheduled_at"].is_string());
+}
+
+#[tokio::test]
+async fn test_pull_checkpoint_tolerance_and_push_new_watermark() {
+    let Some((router, _state)) = setup_test_app().await else {
+        return;
+    };
+
+    let identity_key = make_signing_key(0xC1);
+    let device_1_key = make_signing_key(0xC2);
+    let account_id: [u8; 32] = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .chain(Uuid::new_v4().as_bytes())
+        .copied()
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let device_1_id = Uuid::new_v4();
+    let wrap_b64u = URL_SAFE_NO_PAD.encode([0x55u8; 105]);
+
+    let reg_body = serde_json::json!({
+        "account_id": URL_SAFE_NO_PAD.encode(account_id),
+        "identity_ed25519_pub": URL_SAFE_NO_PAD.encode(identity_key.verifying_key().to_bytes()),
+        "identity_x25519_pub": URL_SAFE_NO_PAD.encode([0x33u8; 32]),
+        "derivation_version": 1,
+        "recovery_wrap": wrap_b64u,
+        "device": {
+            "device_id": device_1_id.to_string(),
+            "device_ed25519_pub": URL_SAFE_NO_PAD.encode(device_1_key.verifying_key().to_bytes()),
+            "device_x25519_pub": URL_SAFE_NO_PAD.encode([0x44u8; 32]),
+            "device_label": "Device 1",
+            "wrap": wrap_b64u,
+        }
+    });
+    let reg_req = sign_request(
+        "POST",
+        "/v1/accounts",
+        &serde_json::to_vec(&reg_body).unwrap(),
+        &identity_key,
+        &account_id,
+        None,
+        true,
+    );
+    assert_eq!(
+        router.clone().oneshot(reg_req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    // Push 2 items from caught-up device -> server returns new_watermark = 2
+    let batch_body = serde_json::json!({
+        "operations": [
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": URL_SAFE_NO_PAD.encode([0x11u8; 64]),
+            },
+            {
+                "op": "put",
+                "operation_id": Uuid::new_v4().to_string(),
+                "item_id": Uuid::new_v4().to_string(),
+                "base_version": 0,
+                "key_version": 1,
+                "blob": URL_SAFE_NO_PAD.encode([0x22u8; 64]),
+            }
+        ]
+    });
+    let batch_req = sign_request(
+        "POST",
+        "/v1/sync/batch",
+        &serde_json::to_vec(&batch_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    let batch_res = router.clone().oneshot(batch_req).await.unwrap();
+    assert_eq!(batch_res.status(), StatusCode::OK);
+    let batch_json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(batch_res.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(batch_json["new_watermark"].as_u64(), Some(2));
+
+    // Pull with checkpoint <= last_seen_seq (1 <= 2) succeeds
+    let pull_ok_body = serde_json::json!({ "checkpoint": 1, "page_size": 100 });
+    let pull_ok_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &serde_json::to_vec(&pull_ok_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    assert_eq!(
+        router.clone().oneshot(pull_ok_req).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Pull with checkpoint > last_seen_seq (5 > 2) is rejected
+    let pull_bad_body = serde_json::json!({ "checkpoint": 5, "page_size": 100 });
+    let pull_bad_req = sign_request(
+        "POST",
+        "/v1/sync/pull",
+        &serde_json::to_vec(&pull_bad_body).unwrap(),
+        &device_1_key,
+        &account_id,
+        Some(device_1_id),
+        false,
+    );
+    assert_eq!(
+        router.clone().oneshot(pull_bad_req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}

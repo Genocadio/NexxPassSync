@@ -284,21 +284,16 @@ pub async fn approve_pairing(
     .bind(approval.device_id)
     .execute(&mut *tx)
     .await?;
-    sqlx::query(
-        "UPDATE account_events SET actor_device_id = NULL \
-         WHERE account_id = $1 AND actor_device_id = $2",
-    )
-    .bind(&approval.account_id)
-    .bind(approval.device_id)
-    .execute(&mut *tx)
-    .await?;
-    sqlx::query(
-        "DELETE FROM rotation_participants WHERE account_id = $1 AND device_id = $2",
-    )
-    .bind(&approval.account_id)
-    .bind(approval.device_id)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("DELETE FROM account_events WHERE account_id = $1 AND actor_device_id = $2")
+        .bind(&approval.account_id)
+        .bind(approval.device_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM rotation_participants WHERE account_id = $1 AND device_id = $2")
+        .bind(&approval.account_id)
+        .bind(approval.device_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "DELETE FROM devices WHERE account_id = $1 AND device_id = $2 AND revoked_at IS NOT NULL",
     )

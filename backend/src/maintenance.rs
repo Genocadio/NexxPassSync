@@ -110,9 +110,8 @@ pub async fn cleanup_expired_records(pool: &PgPool) -> Result<u64, sqlx::Error> 
     total += res.rows_affected();
 
     let res = sqlx::query(
-        "UPDATE account_events ae \
-         SET actor_device_id = NULL \
-         FROM devices d \
+        "DELETE FROM account_events ae \
+         USING devices d \
          WHERE ae.account_id = d.account_id \
            AND ae.actor_device_id = d.device_id \
            AND d.revoked_at IS NOT NULL \
